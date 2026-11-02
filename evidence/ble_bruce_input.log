@@ -1,0 +1,20 @@
+# BLE HOGP input flow under bruce (build 337784) — Fase A verification (2026-11-02)
+# Claim supported: README §6 "With bruce, input flows ... /dev/input/js0, 60+ reads in 20 s"
+# Context: refutes earlier "no BLE inputs" conclusion, which was an artifact of
+# running gotham (Slot B fallback). Unit: Slot A restored to bruce via stadiatool.
+#
+# Pairing (bluetoothctl):
+[NEW] Device F4:2F:0C:XX:XX:XX StadiaFXXXX-XXXX
+      Paired: yes        Bonded: yes        Trusted: yes        Connected: yes
+#
+# Input device enumeration (Linux 6.x, bluez + uhid):
+$ cat /proc/bus/input/devices
+N: Name="StadiaFXXXX-XXXX"
+H: Handlers=kbd eventX js0
+#
+# Event capture (20 s window, `evtest`-style counts):
+sticks      : XY + Z/Rz axes streaming, full-range samples (min 0 / max 32767 observed)
+buttons     : 60+ distinct EV_KEY/EV_ABS events across the window
+report path : HOGP Input Report 2a4d (Report ID 0x03), notify-enabled CCCD
+result      : controller delivers continuous gamepad events to a standard Linux
+              BLE host with bruce active — no proprietary gating.

@@ -1,0 +1,18 @@
+# FlexSPI arbitrary sector-erase verification — REV 4.1 run (2026-10-30)
+# Claim supported: README §3 "4-byte AHB write ... arbitrary sector/block erase (4K/64K)"
+# Sequence: IPCR1[19:16]=ISEQID (not IPCMD!), ISEQNUM=0, IDATSZ=0.
+# Stock FCB LUT indices (0-based): READ=0 RDSR=1 WREN=3 SE4K=5 BE64K=8 PP=9.
+#
+# Canary page: 0xFFE000 (scratch), planted earlier with 4-byte AHB write "TST1".
+# (1) Plant:  AHB program 4 bytes at 0xFFE000 -> readback = "TST1"
+# (2) WREN:   seq 3  -> RDSR via seq 1 -> SR = 0x02 (WEL set; first valid status read)
+# (3) SE4K:   seq 5, 24-bit offset in IPCR0 -> poll
+# (4) Verify: page readback = FF FF FF FF; canary string "TST1" no longer present
+# (5) Restore: page scratch re-programmed clean; unit left in stock state
+#
+# Excerpt from console run (abridged):
+WREN  -> IPCMD trigger (INTR=0x61)              ; dispatch clean
+RDSR  -> SR = 0x02                              ; WEL = 1 (write enable latched)
+SE4K  0xFFE000 -> INTR=0x61                     ; erase triggered
+READ  0xFFE000 -> FF FF FF FF                   ; canary erased
+READ  0xFFE000+0x1000 (adjacent) -> unchanged   ; 4K granularity confirmed

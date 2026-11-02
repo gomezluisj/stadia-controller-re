@@ -5,7 +5,7 @@
 
 > **Scope & ethics note.** This document describes defensive architecture and analysis methodology only. No exploit code, no private keys, no vendor-confidential material (everything below was recovered from public firmware images and standard RE tooling). The device is a discontinued product; research like this is how its 16 MB of NOR stays useful after its cloud service (and Google's official flasher) went dark in January 2026.
 >
-> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited ~5,300 decompiled functions across all three layers and found no memory-corruption bug in the statically audited parsers (bootloader KVS/slots, USB vendor RPC, BLE GATT Prepare/Execute Write, NVRAM protobuf), while one live BLE path (ATT Signed Write, 0xD2/CSRK, under gotham) remains an **open hardware verdict** (§7.2, §9). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
+> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT106x (measured MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited 5,554 decompiled functions in total (317 restricted flashloader, 547 bootloader, 4,690 application "bruce") and found no memory-corruption bug in the statically audited parsers (bootloader KVS/slots, USB vendor RPC, BLE GATT Prepare/Execute Write, NVRAM protobuf). The BootROM itself was characterized through its SDP/HAB interfaces and live experiments, not decompiled. One live BLE path (ATT Signed Write, 0xD2/CSRK, under gotham) remains an **open hardware verdict** (§7.2, §9). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
 
 ---
 
@@ -13,7 +13,7 @@
 
 | Component | Detail |
 |---|---|
-| SoC | NXP **i.MX RT1061** (RT1060 family, Cortex-M7 600 MHz "crossover" MCU). `USB_ANALOG_DIGPROG` (0x400D8260) reads `0x006C0000` (0x6C = RT1060 family; early project notes mislabeled the part as RT1050 — the measured ID byte was always 0x6C) |
+| SoC | NXP **i.MX RT106x** (Cortex-M7 600 MHz "crossover" MCU). `USB_ANALOG_DIGPROG` (0x400D8260) reads `0x006C0000` (0x6C = RT106x family — the register does not distinguish RT1061/1062/1064; the exact variant MIMXRT1061 comes from PCB silkscreen in public teardowns, lidskialf.net) |
 | Serial flash | GigaDevice GD25 "Giga-16m" NOR, 16 MB, XIP-mapped at `0x60000000`, SPI via FlexSPI |
 | Bluetooth radio | Broadcom **BCM43458F** (BT 4.2 + BLE). Blob string: `;BCM43458F 37.4MHz Google Gotham BT4.2 [Version: 0054.0161]`. Host loads it via HCI patchram at boot |
 | Crypto anchor | HAB (High-Assurance Boot) in mask ROM, RSA-4096/SHA-256; SRK hash fused in OCOTP (not in flash) |
@@ -22,18 +22,17 @@
 
 Serial example referenced throughout: `9C020YCAC6XXXX` (production build; serial masked in this public copy).
 
-### Firmware slots in NOR
+### Firmware layout in NOR (16 MB; physical offset vs XIP address — offsets for stadiatool/flash tools, XIP for Ghidra/execution)
 
-| Region | Content |
-|---|---|
-| `0x00000–0x01000` | FCB (FlexSPI Configuration Block) — LUT table describing SPI sequences |
-| `0x01000` | IVT of the first-stage Google bootloader |
-| `0x800000` (0x60800000 XIP) | Google bootloader (128 KB), own IVT+CSF |
-| `0x60040000–0x6013ffff` | **Slot A** — application image A ("bruce" prod at factory) |
-| `0x140000–0x7fffff` (0x60140000–0x607fffff) | gap1 + non-executable partitions |
-| `0x800000–0x81ffff` (0x60800000–0x6081ffff) | Google bootloader (128 KB), own IVT+CSF |
-| `0x840000–0x93ffff` (0x60840000–0x6093ffff) | **Slot B** — application image B ("gotham" 235551, factory Wi-Fi-era firmware). The 16 MB NOR is split into two symmetric 8 MB halves: half A (+0x000000) holds the boot IVT and Slot A @ 0x60040000; half B (+0x800000) mirrors the structure with Slot B @ 0x60840000 |
-| remainder | KVS (key-value store), bonds/NVRAM for BT, calibration, provisioning, telemetry buffers, factory pages |
+| Region | Physical NOR offset | XIP address | Content |
+|---|---|---|---|
+| FCB | `0x000000–0x000fff` | `0x60000000–0x60000fff` | FlexSPI Configuration Block (LUT at `+0x080`) |
+| Boot IVT | `0x001000` | `0x60001000` | Initial IVT + boot data read by the mask ROM (`entry` 0x60800010 → bootloader, no mini stage-1) |
+| Slot A | `0x040000–0x13ffff` | `0x60040000–0x6013ffff` | Application image A ("bruce" 337784 after the 2023 BT update) |
+| Gap 1 | `0x140000–0x7fffff` | `0x60140000–0x607fffff` | Unallocated / non-executable partitions |
+| Bootloader | `0x800000–0x81ffff` | `0x60800000–0x6081ffff` | Google second-stage bootloader (128 KB), own IVT+CSF |
+| Slot B | `0x840000–0x93ffff` | `0x60840000–0x6093ffff` | Application image B ("gotham" 235551, factory Wi-Fi-era firmware) |
+| Data / KVS | `0x940000–0xffffff` | `0x60940000–0x60ffffff` | KVS, BLE bonds/NVRAM, calibration, provisioning, telemetry buffers, factory pages |
 
 Only the executable slot ranges are signed/verified. Everything else (KVS, NVRAM, calibration) **is not covered by HAB** — see §7 for the audit result of eating from those regions anyway.
 

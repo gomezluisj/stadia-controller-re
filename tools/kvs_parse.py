@@ -94,10 +94,15 @@ class Region:
 
 # ---------------------------------------------------------- sector scan ----
 
-def find_sector_candidates(region):
+def find_sector_candidates(region, sector_align=None):
     """Offsets (region-relative) of plausible sector headers: magic +
     version in range, and the record area either starts with a record magic
-    or is uniformly erased/zero (formatted-but-empty / padded sector)."""
+    or is uniformly erased/zero (formatted-but-empty / padded sector).
+
+    If sector_align is given (default 0x1000 when parsing real NOR regions,
+    off for synthetic buffers), only offsets aligned to it are accepted —
+    a 0xABCD appearing inside record payload data can never be mistaken
+    for a sector header, because records do not start on sector boundaries."""
     data = region.data
     out = []
     start = 0
@@ -106,6 +111,8 @@ def find_sector_candidates(region):
         if i < 0:
             break
         start = i + 1
+        if sector_align and (i % sector_align) != 0:
+            continue
         if i + 16 > len(data):
             continue
         ver = u16(data, i + 2)
@@ -167,16 +174,19 @@ def walk_sector(region, sec_off, span_end, g):
         pos += total
     return records, pos, torn
 
-def parse_regions(regions, align_override=None):
+def parse_regions(regions, align_override=None, sector_align=None):
     """Returns (sectors, records, align_used). Sector spans run to the next
     accepted header or the region end. Alignment is auto-detected by scoring
-    each candidate: most CRC-valid records, then most clean sectors."""
+    each candidate: most CRC-valid records, then most clean sectors.
+
+    sector_align (e.g. 0x1000 for real 4 KB NOR sectors) restricts which
+    offsets may host a sector header; pass None for synthetic buffers."""
     aligns = [align_override] if align_override else list(ALIGN_CANDIDATES)
     best = None
     for g in aligns:
         sectors, records = [], []
         for region in regions:
-            cands = find_sector_candidates(region)
+            cands = find_sector_candidates(region, sector_align)
             accepted_end = -1
             for idx, soff in enumerate(cands):
                 if soff < accepted_end:
@@ -206,18 +216,36 @@ def parse_regions(regions, align_override=None):
 
 def resolve_winners(records):
     """Per key: winner = max by (sector sequence, absolute offset).
-    Returns {key_str: winning_record}."""
+    Returns ({key_str: winning_record}, ambiguities) where ambiguities lists
+    keys whose top-2 candidates share the same sector sequence across
+    different sectors — the relative-order guarantee of the firmware between
+    two distinct sectors with equal sequence is not established, so the
+    winner is flagged rather than silently tie-broken by offset."""
     winners = {}
+    per_key = {}
     for r in records:
         try:
             key = r["key_bytes"].decode("ascii")
         except UnicodeDecodeError:
             continue
+        cands = per_key.setdefault(key, [])
+        cands.append(r)
         cur = winners.get(key)
         rank = (r["_sector_seq"], r["offset"])
         if cur is None or rank >= (cur["_sector_seq"], cur["offset"]):
             winners[key] = r
-    return winners
+    ambiguities = []
+    for key, cands in per_key.items():
+        seqs = {r["_sector_seq"] for r in cands}
+        if cands and len(cands) > 1:
+            top = max(cands, key=lambda r: (r["_sector_seq"], r["offset"]))
+            rivals = [r for r in cands if r is not top
+                      and r["_sector_seq"] == top["_sector_seq"]]
+            if rivals:
+                ambiguities.append({"key": key, "sequence": top["_sector_seq"],
+                                    "winner_offset": top["offset"],
+                                    "rival_offsets": [r["offset"] for r in rivals]})
+    return winners, ambiguities
 
 def verdicts(winners):
     v = {}
@@ -371,7 +399,7 @@ def selftest():
 
     sectors, records, used_g = parse_regions([region])
     attach_seqs(sectors, records)
-    winners = resolve_winners(records)
+    winners, ambiguities = resolve_winners(records)
     verd = verdicts(winners)
 
     fails = []
@@ -405,6 +433,32 @@ def selftest():
     target = [r for r in recs2 if r["key_bytes"] == b"SsdpUdn"]
     check("corrupted record still parsed, CRC flagged bad",
           len(target) == 2 and any(r["crc_stored"] != r["crc_computed"] for r in target))
+
+    # False-positive guard: a 0xABCD sequence embedded inside a record area
+    # must not be accepted as a sector header when sector alignment applies
+    # (real NOR sectors are 4 KB aligned; here 512 B synthetic alignment).
+    fp = bytearray(blob)
+    ins = 40  # inside sector 1, NOT a multiple of the 512 B sector stride
+    fp[ins:ins] = b"\xcd\xab\x02\x00\x00\x00\x00\x00" + b"\x00" * 8
+    sectors_fp, _, _ = parse_regions([Region("selftest-fp", 0x60F00000, bytes(fp))],
+                                     align_override=4, sector_align=512)
+    check("0xABCD inside payload not accepted as header (sector_align)",
+          all(s["offset"] != 0x60F00000 + ins for s in sectors_fp))
+
+    # sector_sequence collision across distinct sectors -> ambiguity flag
+    def fake_rec(key, value, seq, off):
+        return {"key_bytes": key, "value": value, "live": True,
+                "_sector_seq": seq, "offset": off,
+                "crc_stored": 0, "crc_computed": 0}
+    r_a = fake_rec(b"CollideKey", b"AAAA", 7, 0x100)
+    r_b = fake_rec(b"CollideKey", b"BBBB", 7, 0x300)  # same seq, other sector
+    win_c, amb_c = resolve_winners([r_a, r_b])
+    check("sequence collision flagged ambiguous", len(amb_c) == 1 and
+          amb_c[0]["key"] == "CollideKey")
+    r_c = fake_rec(b"CollideKey", b"CCCC", 8, 0x900)  # higher seq wins cleanly
+    win_d, amb_d = resolve_winners([r_a, r_c])
+    check("distinct sequences resolve cleanly", len(amb_d) == 0 and
+          win_d["CollideKey"]["value"] == r_c["value"])
 
     print("SELFTEST " + ("PASS" if not fails else "FAIL: %s" % ", ".join(fails)))
     return 0 if not fails else 1
@@ -442,7 +496,7 @@ def main(argv=None):
 
     sectors, records, g = parse_regions(regions, args.align)
     attach_seqs(sectors, records)
-    winners = resolve_winners(records)
+    winners, ambiguities = resolve_winners(records)
     verd = verdicts(winners)
 
     if args.json == "-":
