@@ -5,7 +5,7 @@
 
 > **Scope & ethics note.** This document describes defensive architecture and analysis methodology only. No exploit code, no private keys, no vendor-confidential material (everything below was recovered from public firmware images and standard RE tooling). The device is a discontinued product; research like this is how its 16 MB of NOR stays useful after its cloud service (and Google's official flasher) went dark in January 2026.
 >
-> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited ~5,300 decompiled functions across all three layers and found **no memory-corruption path reachable from attacker-controlled input** (USB, BLE, or untrusted NOR regions). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
+> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited ~5,300 decompiled functions across all three layers and found no memory-corruption bug in the statically audited parsers (bootloader KVS/slots, USB vendor RPC, BLE GATT Prepare/Execute Write, NVRAM protobuf), while one live BLE path (ATT Signed Write, 0xD2/CSRK, under gotham) remains an **open hardware verdict** (§7.2, §9). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
 
 ---
 
@@ -13,7 +13,7 @@
 
 | Component | Detail |
 |---|---|
-| SoC | NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 600 MHz "crossover" MCU). Silicon ID `0x6c0000` readable at USB_ANALOG_DIGPROG `0x400D8260` (`0x6b0000` = RT1050, `0x6c0000` = RT1060) |
+| SoC | NXP i.MX RT1060 (Cortex-M7 600 MHz "crossover" MCU). Silicon ID `0x6c0000` readable at USB_ANALOG_DIGPROG `0x400D8260` (`0x6b0000` = RT1050, `0x6c0000` = RT1060) |
 | Serial flash | GigaDevice GD25 "Giga-16m" NOR, 16 MB, XIP-mapped at `0x60000000`, SPI via FlexSPI |
 | Bluetooth radio | Broadcom **BCM43458F** (BT 4.2 + BLE). Blob string: `;BCM43458F 37.4MHz Google Gotham BT4.2 [Version: 0054.0161]`. Host loads it via HCI patchram at boot |
 | Crypto anchor | HAB (High-Assurance Boot) in mask ROM, RSA-4096/SHA-256; SRK hash fused in OCOTP (not in flash) |
@@ -30,7 +30,9 @@ Serial example referenced throughout: `9C020YCAC6XXXX` (production build; serial
 | `0x01000` | IVT of the first-stage Google bootloader |
 | `0x800000` (0x60800000 XIP) | Google bootloader (128 KB), own IVT+CSF |
 | `0x60040000–0x6013ffff` | **Slot A** — application image A ("bruce" prod at factory) |
-| `0x840000` (0x60840000) | **Slot B** — application image B ("gotham" 235551, Wi-Fi-era factory firmware). The 16 MB NOR is split into two symmetric 8 MB halves: half A (+0x000000) holds the boot IVT and Slot A @ 0x60040000; half B (+0x800000) mirrors the structure with Slot B @ 0x60840000 |
+| `0x140000–0x7fffff` (0x60140000–0x607fffff) | gap1 + non-executable partitions |
+| `0x800000–0x81ffff` (0x60800000–0x6081ffff) | Google bootloader (128 KB), own IVT+CSF |
+| `0x840000–0x93ffff` (0x60840000–0x6093ffff) | **Slot B** — application image B ("gotham" 235551, factory Wi-Fi-era firmware). The 16 MB NOR is split into two symmetric 8 MB halves: half A (+0x000000) holds the boot IVT and Slot A @ 0x60040000; half B (+0x800000) mirrors the structure with Slot B @ 0x60840000 |
 | remainder | KVS (key-value store), bonds/NVRAM for BT, calibration, provisioning, telemetry buffers, factory pages |
 
 Only the executable slot ranges are signed/verified. Everything else (KVS, NVRAM, calibration) **is not covered by HAB** — see §7 for the audit result of eating from those regions anyway.
@@ -50,9 +52,9 @@ Mask ROM (HAB4.1)                                  — NXP code, non-updatable
     csf       0x60818000   (the bootloader's own CSF, next to it at 0x800000)
   → verifies bootloader IVT+CSF @ 0x60800000
 Google bootloader (128 KB @ flash offset 0x800000) — 547 functions decompiled
-  → SHA-256 each slot image vs KVS metadata (AppAMeta/AppBMeta/RecoveryMeta)
+  → checks slot SHA-256 vs KVS metadata (AppAMeta/AppBMeta/RecoveryMeta) when KVS entries exist
   → invokes ROM HAB to verify slot IVT+CSF (key IMG3_1_usr)
-  → jumps to slot A image (bruce, 0x60040000)
+  → jumps to active slot image (Slot A bruce @ 0x60040000, or fallback Slot B @ 0x60840000)
 bruce / gotham (application)                        — 4,690 functions decompiled
   → loads BCM43458F patchram, bring-up board/USB/BLE, runs stack + game logic
 ```
@@ -109,7 +111,7 @@ Key facts recovered from decompilation of the bootloader (`~/ghidra_work/decomp_
 
 | CVE | Verdict on RT1060 |
 |---|---|
-| CVE-2022-45163 (SDP info leak) | **Applies in class** (RT1060 is on NXP's affected list for the same ROM SDP code) but the vector is a *timing side channel in `CHECK_DATA` within DCD*, not `READ_REGISTER` (which returns synthetic constants). Not exploited here; if you replicate the NCC Group/fox-it PoC you'd get a slow read primitive for OCOTP/fuses — research leverage, not code-exec. |
+| CVE-2022-45163 (SDP info leak) | **Applies in class** (corrected assessment): the project's initial test of `READ_REGISTER` returned synthetic constants and early logs closed this CVE on that basis; red-team review corrected it — the actual vector is a *timing side channel in `CHECK_DATA` within DCD* (NCC Group/Fox-IT), not `READ_REGISTER`. That PoC remains untested on this unit and would yield a slow read primitive for OCOTP/fuses — research leverage, not code-exec. |
 | CVE-2026-19736 (TRNG) | No — targets i.MX RT5xx/RT6xx TRNG driver |
 | CVE-2021-31532 (ROM patch peripheral) | No — LPC55xx / RT500 / RT600 family |
 
@@ -156,11 +158,13 @@ Report Map content: 15 buttons (`95 0f` — A B X Y, L1 R1 L3 R3, menu, capture,
 
 ---
 
-## 7. Security audit of the application firmware (all vectors closed)
+## 7. Security audit of the application firmware (audited paths & open questions)
 
 Method: Ghidra 12.2 headless, `ARM:LE:32:v8T`, BinaryLoader at `0x60040000`; full decompilation to ~169k lines / 4,690 functions. Heuristic scan for stack arrays indexed by unbounded variables, then manual review of top candidates. Reference implementations of the audit scripts can be reconstructed trivially (search, rank by `varIdx` count, read the top N).
 
-### 7.1 USB vendor RPC (post-boot, unauthenticated)
+### 7.1 USB vendor RPC (static audit)
+
+Note: this section documents static analysis of the decompiled handler. On live hardware running bruce, the USB bulk vendor interface did not arm by default during runtime testing.
 
 Dispatcher `FUN_60077362` — dispatches by **verb** (`param_2`, 0x0–0xd), not by payload opcode:
 
@@ -175,13 +179,13 @@ Dispatcher `FUN_60077362` — dispatches by **verb** (`param_2`, 0x0–0xd), not
 
 Every length check is `strnlen`-style (`FUN_600db002` is literally a bounded strlen) with explicit upper bound rejection. **No overflow.** Scope note: this is a **static audit** of the decompiled dispatcher; in the live unit the unauthenticated USB vendor endpoint is a factory/provisioning channel that is not armed by default in normal user operation. Note for researchers: the dispatcher's "invalid opcode" log is a live oracle — unknown verbs produce identifiable log output, making fuzzing measurable (we just found nothing to fuzz into).
 
-### 7.2 BLE GATT write path
+### 7.2 BLE GATT write paths (Prepare/Execute closed statically; Signed Write open in hardware)
 
 - Prepare Write `FUN_60069160`: reassembly buffer at `ctx+0x1ac0` (0x259 bytes), check `offset + len < 0x259` with both operands `uint` and `len` bounded by MTU — **correct**.
 - Execute Write `FUN_60069b20` → `FUN_6006ad00`: the Prepare-Write **value_offset is never persisted** (only handle @0x1abc and accumulated length @0x1abe) — the classic two-phase offset-overflow trap is dead by design.
-- Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers are individually sized.
+- Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers were not exhaustively audited.
 
-Scope note: this static closure covers **Prepare/Execute Write (ATT opcodes 0x16/0x18)** in FUN_60069160/FUN_60069b20. A separate live experiment against **ATT Signed Write (opcode 0xD2 with CSRK)** was performed under the gotham image and its hardware verdict was left open there; closing it statically for bruce would mean auditing the 0xD2 handler in `bruce_decomp.c` (straightforward follow-up for a future researcher). Not a primary overflow path.
+Scope note: this static closure covers **Prepare/Execute Write (ATT opcodes 0x16/0x18)** in FUN_60069160/FUN_60069b20. A separate live experiment against **ATT Signed Write (opcode 0xD2 with CSRK)** was performed under the gotham image with an ambiguous hardware result and was not conclusively closed; it remains the top open runtime question (§9). Closing it statically for bruce would mean auditing the 0xD2 handler in `bruce_decomp.c`.
 
 ### 7.3 Untrusted NOR → boot-time parsers (the "interesting" one)
 
@@ -200,15 +204,25 @@ Since HAB only covers executable slots, and we have arbitrary NOR erase/write vi
 
 ---
 
-## 8. Reusable tooling & artifacts (what made this tractable)
+## 8. Repository contents & reference hashes
 
-| Artifact | Purpose |
+### Included in this repository
+
+| Path | Description |
 |---|---|
-| `stadiatool` (`sdp.py`, `flashloader.py`, `dump_final.py`, `hid.py`) | SDP + flashloader protocol; resumable NOR dump with canary + auto-recovery |
-| Ghidra headless pipeline | `analyzeHeadless` with `-processor ARM:LE:32:v8T -loader BinaryLoader -loader-baseAddr <addr>`; custom `DecompAll.java`/`DecompForce.java`/`Xrefs.java` for bulk decompile, force-create functions Ghidra missed, xref queries |
-| Decompilation corpora | bootloader: 547 funcs; bruce: 4,690 funcs; gotham app: 4.3 MB of C |
-| Firmware dumps | `bruce_pvt_a_prod_signed.bin` (1,050,984 B), dev/stage variants, `bootloader_dump.bin` (sha256 `59ebfd2c…f2ca0`), `flash_head.bin` (FCB + IVT), full NOR segments |
-| KVS parse helper | `kvs_parse.py`, `kvs-parser-spec.md` |
+| `README.md` | This technical architecture and security audit reference |
+| `docs/kvs-parser-spec.md` | Specification of Google's NOR Key-Value Store (KVS) record format |
+| `tools/kvs_parse.py` | Python parser for KVS partitions extracted from NOR dumps |
+| `tools/udev/99-stadia-controller.rules` | Linux udev permissions for App (`18d1:9400`), SDP (`1fc9:0135`), and Flashloader (`15a2:0073`) modes |
+| `ghidra/DecompAll.java`, `DecompForce.java`, `Xrefs.java` | Headless Ghidra scripts to reproduce bulk decompilation and xref queries on your own dumps |
+
+### External tools & reference hashes (not hosted)
+
+Copyrighted firmware binaries and full decompilation corpora are excluded via `.gitignore`. To reproduce locally from your own hardware, use GaryOderNichts's `stadiatool` (sdp/flashloader/dump with canary + auto-recovery) plus the FlexSPI primitives in §3, then run `analyzeHeadless` with `-processor ARM:LE:32:v8T -loader BinaryLoader -loader-baseAddr <addr>` and the scripts in `ghidra/`:
+
+- `bootloader_dump.bin`: 131,072 B (sha256 `59ebfd2c…f2ca0`), base `0x60800000`, 547 functions
+- `restricted_ivt_flashloader.bin`: 100,672 B, base `0x20002400`, 317 functions
+- `bruce_pvt_a_prod_signed.bin` (build 337784): 1,050,984 B, base `0x60040000`, 4,690 functions
 
 **Methodological lessons (worth more than the addresses):**
 1. **Verify primitives with raw captures.** Both the SDP tool and BlueZ lied to us at least once each — parser-level output masked what the wire actually carried. btmon/raw-HID under any parser is the only trustworthy ground truth.
@@ -221,11 +235,12 @@ Since HAB only covers executable slots, and we have arbitrary NOR erase/write vi
 
 ## 9. What a future researcher still has open
 
-1. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
-2. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
+1. **The ATT Signed Write (0xD2/CSRK) hardware verdict.** Re-run the signed-write test under controlled instrumentation, comparing gotham vs. bruce handlers, to determine whether the ambiguous live result corresponds to a reachable corruption primitive — or close it statically first by auditing the 0xD2 handler in `bruce_decomp.c`.
+2. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
+3. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
 3. **Switch 2 protocol emulation** on the radio itself requires speaking Nintendo's proprietary BLE from the controller's own BT chip — not reachable with signed stock firmware; would need either a custom image (HAB blocks) or a hardware transplant. The beacon/wake spec is however fully documented publicly (ndeadly, alexvnesta) and reproducible from any other BLE-capable device you control.
 4. **Gotham's Wi-Fi subsystem** was not audited to the same depth as bruce (pattern of defensive style suggests closure, but it's declared rather than measured).
-5. **The bootloader's ASN.1/PKCS#7 path** was verified as delegated-to-ROM (§4) but not line-audited — a candidate if anyone wants one more leaf to turn over.
+5. **The bootloader's ASN.1/PKCS#7 path** and the individual GATT vtable `+0x10` write callbacks were verified only at a coarse level — candidates if anyone wants more leaves to turn over.
 
 ---
 

@@ -4,7 +4,7 @@ import ghidra.program.model.listing.*;
 import java.io.*;
 public class DecompAll extends GhidraScript {
     public void run() throws Exception {
-        String out = getScriptArgs().length > 0 ? getScriptArgs()[0] : "/home/luis/ghidra_work/bruce_decomp.c";
+        String out = getScriptArgs().length > 0 ? getScriptArgs()[0] : "./ghidra_work/bruce_decomp.c";
         PrintWriter w = new PrintWriter(new FileWriter(out));
         DecompInterface di = new DecompInterface();
         di.openProgram(currentProgram);
