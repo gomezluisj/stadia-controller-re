@@ -5,7 +5,7 @@
 
 > **Scope & ethics note.** This document describes defensive architecture and analysis methodology only. No exploit code, no private keys, no vendor-confidential material (everything below was recovered from public firmware images and standard RE tooling). The device is a discontinued product; research like this is how its 16 MB of NOR stays useful after its cloud service (and Google's official flasher) went dark in January 2026.
 >
-> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT1050 (Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited ~5,300 decompiled functions across all three layers and found **no memory-corruption path reachable from attacker-controlled input** (USB, BLE, or untrusted NOR regions). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
+> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited ~5,300 decompiled functions across all three layers and found **no memory-corruption path reachable from attacker-controlled input** (USB, BLE, or untrusted NOR regions). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
 
 ---
 
@@ -13,14 +13,14 @@
 
 | Component | Detail |
 |---|---|
-| SoC | NXP i.MX RT1050 (Cortex-M7 600 MHz "crossover" MCU). MCU ID `0x6c0000` readable at `0x400D8260` |
+| SoC | NXP i.MX RT1060 (MIMXRT1061, Cortex-M7 600 MHz "crossover" MCU). Silicon ID `0x6c0000` readable at USB_ANALOG_DIGPROG `0x400D8260` (`0x6b0000` = RT1050, `0x6c0000` = RT1060) |
 | Serial flash | GigaDevice GD25 "Giga-16m" NOR, 16 MB, XIP-mapped at `0x60000000`, SPI via FlexSPI |
 | Bluetooth radio | Broadcom **BCM43458F** (BT 4.2 + BLE). Blob string: `;BCM43458F 37.4MHz Google Gotham BT4.2 [Version: 0054.0161]`. Host loads it via HCI patchram at boot |
 | Crypto anchor | HAB (High-Assurance Boot) in mask ROM, RSA-4096/SHA-256; SRK hash fused in OCOTP (not in flash) |
 | USB IDs | App mode `18d1:9400` (Google), BootROM SDP `1fc9:0135`, Google flashloader `15a2:0073` |
 | BLE identity | Name `StadiaFXXXX-XXXX` (suffix = last 2 bytes of MAC), pure LE (`Flags 0x06` — BR/EDR not supported). Advertising window ≈ 2 min after pairing mode (orange LED blink), then sleeps — re-enter with 4+ s Stadia-button hold |
 
-Serial example referenced throughout: `9C020YCAC6F7B2` (pvt/production build).
+Serial example referenced throughout: `9C020YCAC6XXXX` (production build; serial masked in this public copy).
 
 ### Firmware slots in NOR
 
@@ -30,7 +30,7 @@ Serial example referenced throughout: `9C020YCAC6F7B2` (pvt/production build).
 | `0x01000` | IVT of the first-stage Google bootloader |
 | `0x800000` (0x60800000 XIP) | Google bootloader (128 KB), own IVT+CSF |
 | `0x60040000–0x6013ffff` | **Slot A** — application image A ("bruce" prod at factory) |
-| `0x60140000–…` | **Slot B** — application image B ("gotham" 235551, Wi-Fi-era firmware) |
+| `0x840000` (0x60840000) | **Slot B** — application image B ("gotham" 235551, Wi-Fi-era factory firmware). The 16 MB NOR is split into two symmetric 8 MB halves: half A (+0x000000) holds the boot IVT and Slot A @ 0x60040000; half B (+0x800000) mirrors the structure with Slot B @ 0x60840000 |
 | remainder | KVS (key-value store), bonds/NVRAM for BT, calibration, provisioning, telemetry buffers, factory pages |
 
 Only the executable slot ranges are signed/verified. Everything else (KVS, NVRAM, calibration) **is not covered by HAB** — see §7 for the audit result of eating from those regions anyway.
@@ -107,9 +107,9 @@ Key facts recovered from decompilation of the bootloader (`~/ghidra_work/decomp_
 
 ### CVE applicability (checked, not assumed)
 
-| CVE | Verdict on RT1050 |
+| CVE | Verdict on RT1060 |
 |---|---|
-| CVE-2022-45163 (SDP info leak) | **Applies in class** (RT1050 is on NXP's affected list) but the vector is a *timing side channel in `CHECK_DATA` within DCD*, not `READ_REGISTER` (which returns synthetic constants). Not exploited here; if you replicate the NCC Group/fox-it PoC you'd get a slow read primitive for OCOTP/fuses — research leverage, not code-exec. |
+| CVE-2022-45163 (SDP info leak) | **Applies in class** (RT1060 is on NXP's affected list for the same ROM SDP code) but the vector is a *timing side channel in `CHECK_DATA` within DCD*, not `READ_REGISTER` (which returns synthetic constants). Not exploited here; if you replicate the NCC Group/fox-it PoC you'd get a slow read primitive for OCOTP/fuses — research leverage, not code-exec. |
 | CVE-2026-19736 (TRNG) | No — targets i.MX RT5xx/RT6xx TRNG driver |
 | CVE-2021-31532 (ROM patch peripheral) | No — LPC55xx / RT500 / RT600 family |
 
@@ -134,7 +134,7 @@ A **protobuf-over-USB vendor channel** exists in bruce's *app* mode (post-boot, 
 
 ## 6. BLE profile (measured, end-to-end)
 
-Instrumentation: Linux BlueZ + `btmon` raw captures, against `F4:2F:0C:F8:15:D5` with fresh bond.
+Instrumentation: Linux BlueZ + `btmon` raw captures, against `F4:2F:0C:XX:XX:XX` (MAC masked in this public copy) with fresh bond.
 
 Services — **100% SIG-standard UUIDs, zero Google-proprietary GATT**:
 
@@ -152,7 +152,7 @@ Report Map content: 15 buttons (`95 0f` — A B X Y, L1 R1 L3 R3, menu, capture,
 2. Requires a **registered pairing agent** in the connecting process (`bluetoothctl default-agent`, `NoInputNoOutput`); silent failures log as `"No agent available for request type 2"` in bluetoothd.
 3. Connection must be initiated **inside the advertising window** — re-enter pairing mode if it slept.
 
-**With bruce, input flows:** verified end-to-end on Linux — the unit enumerates as `/dev/input/js0` (`StadiaF7B2-15d5`), sticks/buttons/triggers produce continuous events over 60+ reads in 20 s. *Earlier claims of "no input reports" were an artifact of testing under gotham (the Wi-Fi-era fallback), not bruce.* If you inherited an unresponsive unit, check which image is actually running in slot A.
+**With bruce, input flows:** verified end-to-end on Linux — the unit enumerates as `/dev/input/js0` (`StadiaXXXX-XXXX`), sticks/buttons/triggers produce continuous events over 60+ reads in 20 s. *Earlier claims of "no input reports" were an artifact of testing under gotham (the Wi-Fi-era fallback), not bruce.* If you inherited an unresponsive unit, check which image is actually running in slot A.
 
 ---
 
@@ -173,13 +173,15 @@ Dispatcher `FUN_60077362` — dispatches by **verb** (`param_2`, 0x0–0xd), not
 | 0xb, 0xc | state getters | no copy |
 | default | logs `"Invalid vendor RPC request: "` | — |
 
-Every length check is `strnlen`-style (`FUN_600db002` is literally a bounded strlen) with explicit upper bound rejection. **No overflow.** Note for researchers: the dispatcher's "invalid opcode" log is a live oracle — unknown verbs produce identifiable log output, making fuzzing measurable (we just found nothing to fuzz into).
+Every length check is `strnlen`-style (`FUN_600db002` is literally a bounded strlen) with explicit upper bound rejection. **No overflow.** Scope note: this is a **static audit** of the decompiled dispatcher; in the live unit the unauthenticated USB vendor endpoint is a factory/provisioning channel that is not armed by default in normal user operation. Note for researchers: the dispatcher's "invalid opcode" log is a live oracle — unknown verbs produce identifiable log output, making fuzzing measurable (we just found nothing to fuzz into).
 
 ### 7.2 BLE GATT write path
 
 - Prepare Write `FUN_60069160`: reassembly buffer at `ctx+0x1ac0` (0x259 bytes), check `offset + len < 0x259` with both operands `uint` and `len` bounded by MTU — **correct**.
 - Execute Write `FUN_60069b20` → `FUN_6006ad00`: the Prepare-Write **value_offset is never persisted** (only handle @0x1abc and accumulated length @0x1abe) — the classic two-phase offset-overflow trap is dead by design.
-- Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers are individually sized. Not a primary overflow path.
+- Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers are individually sized.
+
+Scope note: this static closure covers **Prepare/Execute Write (ATT opcodes 0x16/0x18)** in FUN_60069160/FUN_60069b20. A separate live experiment against **ATT Signed Write (opcode 0xD2 with CSRK)** was performed under the gotham image and its hardware verdict was left open there; closing it statically for bruce would mean auditing the 0xD2 handler in `bruce_decomp.c` (straightforward follow-up for a future researcher). Not a primary overflow path.
 
 ### 7.3 Untrusted NOR → boot-time parsers (the "interesting" one)
 
@@ -230,7 +232,7 @@ Since HAB only covers executable slots, and we have arbitrary NOR erase/write vi
 ## 10. Credits & pointer material
 
 - GaryOderNichts — 2023 write-up identifying Google's restricted flashloader and the NOR-read path via the FlexSPI register window (`0x402A8000`); the original `stadiatool` base builds on that work.
-- NXP i.MX RT1050 RM (BootROM/HAB chapters), `fsl_flexspi` SDK sources, u-boot `hab.h` — for ROM contract identification.
+- NXP i.MX RT1060 RM (BootROM/HAB chapters), `fsl_flexspi` SDK sources, u-boot `hab.h` — for ROM contract identification.
 - NCC Group / fox-it — CVE-2022-45163 research (real vector is the `CHECK_DATA` timing channel).
 - ndeadly (`switch2_controller_research`), alexvnesta (`switch2controller`), `playgate-switch2-gateway` — the public Switch 2 BLE host spec.
 - nanopb — its `.rodata` error strings are the smoking gun that identified the NVRAM serialization format.
