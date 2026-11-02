@@ -13,7 +13,7 @@
 
 | Component | Detail |
 |---|---|
-| SoC | NXP i.MX RT1060 (Cortex-M7 600 MHz "crossover" MCU). Silicon ID `0x6c0000` readable at USB_ANALOG_DIGPROG `0x400D8260` (`0x6b0000` = RT1050, `0x6c0000` = RT1060) |
+| SoC | NXP **i.MX RT1061** (RT1060 family, Cortex-M7 600 MHz "crossover" MCU). `USB_ANALOG_DIGPROG` (0x400D8260) reads `0x006C0000` (0x6C = RT1060 family; early project notes mislabeled the part as RT1050 — the measured ID byte was always 0x6C) |
 | Serial flash | GigaDevice GD25 "Giga-16m" NOR, 16 MB, XIP-mapped at `0x60000000`, SPI via FlexSPI |
 | Bluetooth radio | Broadcom **BCM43458F** (BT 4.2 + BLE). Blob string: `;BCM43458F 37.4MHz Google Gotham BT4.2 [Version: 0054.0161]`. Host loads it via HCI patchram at boot |
 | Crypto anchor | HAB (High-Assurance Boot) in mask ROM, RSA-4096/SHA-256; SRK hash fused in OCOTP (not in flash) |
@@ -235,8 +235,9 @@ Copyrighted firmware binaries and full decompilation corpora are excluded via `.
 
 ## 9. What a future researcher still has open
 
-1. **The ATT Signed Write (0xD2/CSRK) hardware verdict.** Re-run the signed-write test under controlled instrumentation, comparing gotham vs. bruce handlers, to determine whether the ambiguous live result corresponds to a reachable corruption primitive — or close it statically first by auditing the 0xD2 handler in `bruce_decomp.c`.
-2. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
+1. **Resolving the ATT Signed Write (0xD2 / CSRK) hardware verdict.** Re-run the signed-write test under controlled instrumentation, comparing the 0xD2 opcode handler between gotham and bruce, to determine whether the ambiguous live result observed under gotham corresponds to a reachable corruption primitive.
+2. **Deep audit of gotham (Slot B, build 235551).** Because gotham is a valid Google-signed image that runs automatically on any Slot A fallback — and includes the full legacy Wi-Fi + network provisioning stack removed in bruce — it represents a larger and less-audited runtime attack surface than bruce. Assuming it shares bruce's clean bill of health without an equivalent function-by-function audit would be premature.
+3. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
 3. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
 3. **Switch 2 protocol emulation** on the radio itself requires speaking Nintendo's proprietary BLE from the controller's own BT chip — not reachable with signed stock firmware; would need either a custom image (HAB blocks) or a hardware transplant. The beacon/wake spec is however fully documented publicly (ndeadly, alexvnesta) and reproducible from any other BLE-capable device you control.
 4. **Gotham's Wi-Fi subsystem** was not audited to the same depth as bruce (pattern of defensive style suggests closure, but it's declared rather than measured).
@@ -246,7 +247,8 @@ Copyrighted firmware binaries and full decompilation corpora are excluded via `.
 
 ## 10. Credits & pointer material
 
-- GaryOderNichts — 2023 write-up identifying Google's restricted flashloader and the NOR-read path via the FlexSPI register window (`0x402A8000`); the original `stadiatool` base builds on that work.
+- GaryOderNichts — original Stadia Controller flashloader reverse engineering and `stadiatool` (2023, github.com/GaryOderNichts/StadiaController), which first documented the FlexSPI register access path in Google's restricted flashloader.
+- lidskialf.net (Andrew de Quincey) — hardware teardown of the Stadia Controller PCB that physically identified the SoC as NXP i.MX RT1061.
 - NXP i.MX RT1060 RM (BootROM/HAB chapters), `fsl_flexspi` SDK sources, u-boot `hab.h` — for ROM contract identification.
 - NCC Group / fox-it — CVE-2022-45163 research (real vector is the `CHECK_DATA` timing channel).
 - ndeadly (`switch2_controller_research`), alexvnesta (`switch2controller`), `playgate-switch2-gateway` — the public Switch 2 BLE host spec.
