@@ -1,0 +1,5 @@
+# Google Stadia Controller USB modes
+# App mode (18d1:9400), BootROM SDP (1fc9:0135), Google restricted flashloader (15a2:0073)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="18d1", ATTRS{idProduct}=="9400", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1fc9", ATTRS{idProduct}=="0135", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="15a2", ATTRS{idProduct}=="0073", MODE="0666", TAG+="uaccess"

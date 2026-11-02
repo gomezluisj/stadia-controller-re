@@ -1,0 +1,14 @@
+# Firmware dumps and raw NOR images (do not redistribute copyrighted binaries)
+*.bin
+*.elf
+*.rom
+*.hex
+# Full decompilation outputs and Ghidra project databases
+*_decomp.c
+decomp_all.c
+*.gpr
+*.rep/
+# Python / OS artifacts
+__pycache__/
+*.pyc
+.DS_Store
