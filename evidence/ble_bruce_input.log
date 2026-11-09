@@ -1,4 +1,4 @@
-# BLE HOGP input flow under bruce (build 337784) — Fase A verification (2026-11-02)
+# BLE HOGP input flow under bruce (build 337784) — Phase A verification (2026-11-02)
 # Claim supported: README §6 "With bruce, input flows ... /dev/input/js0, 60+ reads in 20 s"
 # Context: refutes earlier "no BLE inputs" conclusion, which was an artifact of
 # running gotham (Slot B fallback). Unit: Slot A restored to bruce via stadiatool.

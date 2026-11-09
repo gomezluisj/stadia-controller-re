@@ -67,11 +67,9 @@ refin/refout false, xorout `0x0000`, MSB-first table-driven update
 Code evidence (gotham):
 - `FUN_602E2E5C` (CRC wrapper, 52 B): builds the state struct, stores
   `movw r3, #0xFFFF` as the initial state, calls the update twice —
-  (key, key_len) then (value, value_len). Listing in
-  `crcwork/crcdump.txt`.
+  (key, key_len) then (value, value_len).
 - `FUN_60204DAC` (update): `table[((crc>>8) ^ b)] ^ (crc<<8)`, table pointer
-  loaded from literal `DAT_60204DDC` = **0x60328C34**. Listing in
-  `crcwork/crcupdate.txt`.
+  loaded from literal `DAT_60204DDC` = **0x60328C34**.
 - Call sites: GetValue `FUN_60203EA0` (computes over the query key + the
   value just read; log "KVS CRC does not match for key=%s") and the record
   validator `FUN_60203FA2`.
@@ -83,7 +81,7 @@ Validation (run 2026-10-21, recorded here):
   value. (CRC-16/GENIBUS differs only by xorout 0xFFFF; the wrapper returns
   the raw state with no final complement, which is what fixes xorout = 0.)
 - Bruce: wrapper `FUN_60100C14` is **instruction-identical** (same listing,
-  init 0xFFFF, callee `FUN_600CC29C`; dump in `crcwork/bruce-crc.txt`) and
+  init 0xFFFF, callee `FUN_600CC29C`) and
   the identical 512-byte table is present in the bruce image at VA
   `0x6011ACB6` (byte-for-byte match, verified this session). The bruce
   update callee was not separately dumped; variant identity for bruce rests
@@ -106,11 +104,11 @@ drawing verdicts.
 Feed it every region file with the NOR address of its first byte:
 
 ```bash
-python3 ~/workspace/stadia-gotham-analysis/kvs_parse.py \
+python3 tools/kvs_parse.py \
   --region gap1.bin@0x60002000 \
   --region gap2.bin@0x60424000 \
   --region tail.bin@0x60C24000 \
-  --json ~/workspace/stadia-gotham-analysis/kvs_result.json
+  --json kvs_result.json
 ```
 
 (A single full-NOR dump is `--region full.bin@0x60000000`.) Output: full
@@ -163,8 +161,8 @@ was *also* factory-provisioned.
 verified identical in bruce (§1, §2 — FACT). The token column transfers by
 shared design: bruce's unlock is the same TU (challenge string in its
 security struct, same echo memcmp — FACT, bruce USB audit). The narrower
-claim that bruce's challenge-string writer
-was not traced to the KVS in the bruce audits).
+claim, that bruce's challenge string is likewise seeded from its KVS
+`SsdpUdn` record, was not traced in the bruce audits and remains open.
 
 ## 5. What remains open
 
@@ -176,7 +174,8 @@ was not traced to the KVS in the bruce audits).
   candidate alignment, the format assumptions in §1 must be revisited
   before any verdict is drawn.
 - Sector header bytes +4..+7 and record flags bits 1..15: uninterpreted
-  (reported raw). Neither affects the three verdict keys.
+  (reported raw). Neither affects the verdict keys (IsDfDevice, SsdpUdn,
+  UpdateGauge).
 - The concrete NOR offsets of the KVS partitions (gotham ids 9 and 5)
   remain statically undetermined (triage open item 1); the parser does not
   need them - it finds sectors by header scan anywhere in the dumped
