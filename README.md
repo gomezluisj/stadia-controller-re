@@ -188,7 +188,7 @@ Every length check is `strnlen`-style (`FUN_600db002` is literally a bounded str
 
 - Prepare Write `FUN_60069160`: reassembly buffer at `ctx+0x1ac0` (0x259 bytes), check `offset + len < 0x259` with both operands `uint` and `len` bounded by MTU — **correct**.
 - Execute Write `FUN_60069b20` → `FUN_6006ad00`: the Prepare-Write **value_offset is never persisted** (only handle @0x1abc and accumulated length @0x1abe) — the classic two-phase offset-overflow trap is dead by design.
-- Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers were not exhaustively audited.
+- ~~Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers were not exhaustively audited.~~ **Closed (2026-11-13): sane.** The full write chain was re-derived from the binary (the handlers live outside the original decompilation corpus): ATT PDU entry `FUN_600f6516` validates `PDU length < negotiated MTU` before dispatch; MTU exchange (`FUN_600ae7f8`) clamps to 0x205; the direct-write path (`FUN_600aeb14`, stack buffer 600 B) cannot exceed max PDU payload 514 B; the central validator `FUN_600ad228` enforces properties/encryption/CCC-length before any callback. Per-attribute callbacks, disassembled from the GATT table in rodata (`0x6010b200`): Control Point/Protocol Mode writes clamp to exactly 1 byte (`FUN_600d4414`); Report `2a4d` writes are bound-checked against the report's registered size (`FUN_600df3a8`); read-only attributes are no-ops (`FUN_600d4368/436c`); the CCCD handler stores a u16 and tail-calls the notify; the reassembled-write slot `+0x10` (`FUN_600d4386`) is a pure trampoline whose only HID sink (`FUN_60058aa8`) was already audited (§7.1 addendum / issue #1: len 1–255, report ID 5, copies exactly 4 bytes). No unbounded copy exists at any level.
 
 - **ATT Signed Write (opcode 0xD2 with CSRK) — closed statically across all three images (November 2026).** The server-side write-command handler performs full signature verification before accepting any write, in every image:
 
@@ -276,7 +276,7 @@ Also hashed in `evidence/SHA256SUMS.txt`: `bruce_dvt_a_dev_signed.bin` (the dev-
 2. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
 3. **Switch 2 protocol emulation** on the radio itself requires speaking Nintendo's proprietary BLE from the controller's own BT chip — not reachable with signed stock firmware; would need either a custom image (HAB blocks) or a hardware transplant. The beacon/wake spec is however fully documented publicly (ndeadly, alexvnesta) and reproducible from any other BLE-capable device you control.
 4. **Gotham's Wi-Fi-era network stack** (Wi-Fi provisioning, TCP/IP, the Synapse audio pipeline) was not audited function-by-function; the gotham audit (§7.4) covered its BLE/ATT surface, key-store parsers, and NOR persistence layers.
-5. **The bootloader's ASN.1/PKCS#7 path** and the individual GATT vtable `+0x10` write callbacks were verified only at a coarse level — candidates if anyone wants more leaves to turn over.
+5. **The bootloader's ASN.1/PKCS#7 path** was verified only at a coarse level — a candidate if anyone wants more leaves to turn over. (The GATT vtable `+0x10` write callbacks originally listed here were fully audited on 2026-11-13 — see §7.2.)
 
 ---
 
