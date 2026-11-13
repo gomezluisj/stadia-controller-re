@@ -5,8 +5,10 @@ hardware session produces raw NOR region dumps, the KVS is fully analyzable
 offline — no further reverse engineering needed.
 
 Conventions: **FACT** = backed by cited code/bytes or by a run recorded here.
-**INFERENCE** = labeled deduction. Addresses are gotham 235551 unless marked
-bruce (both images are based at 0x60040000).
+**INFERENCE** = labeled deduction. Addresses are gotham OTA 282115 (linked at
+`0x60040000`, mislabeled `gotham 235551` in early drafts; see `README.md` §8)
+unless marked bruce (also based at `0x60040000`; on-NOR Slot B 235551 starts at
+`0x60840000`).
 
 ## 1. Format as implemented
 
@@ -88,8 +90,10 @@ Validation (run 2026-10-21, recorded here):
   on the identical wrapper + identical table + the triage's line-equivalence
   of GetValue/mount.
 
-Parser behavior: CRC mismatch is a **warning**, never an abort (mirrors the
-firmware's lazy validation); the record is still listed, flagged `crc=BAD`.
+Parser behavior: CRC mismatch is a **warning** on raw records (`crc=BAD`),
+never an abort, while `verdicts()` flags any bad-CRC winner as
+`state="CRC_BAD"` (`crc_ok=false`, mirroring firmware `GetValue` rejecting
+with `0xF`) instead of trusting it as `"LIVE"`.
 
 **Still untested**: no genuine on-flash KVS record has ever been parsed (no
 NOR dump of the KVS region exists yet). The CRC is proven against the
@@ -105,25 +109,13 @@ Feed it every region file with the NOR address of its first byte:
 
 ```bash
 python3 tools/kvs_parse.py \
-  --region gap1.bin@0x60002000 \
-  --region gap2.bin@0x60424000 \
-  --region tail.bin@0x60C24000 \
+  --region kvs.bin@0x60940000 \
   --json kvs_result.json
 ```
 
-(A single full-NOR dump is `--region full.bin@0x60000000`.) Output: full
-record listing (offset, sector sequence, key, flags, LIVE/DEAD, CRC status,
-value as hex + u32 + ASCII), sector table (with TORN-TAIL flags), the
-verdict block (§4), and the JSON file with the same data.
+(Earlier triage drafts used `--region gap1.bin@0x60002000 --region gap2.bin@0x60424000 --region tail.bin@0x60C24000`, which reflected pre-`README.md` §1 slice names; a single full-NOR dump is `--region full.bin@0x60000000`.) CLI defaults to `--sector-align 0x1000` (4 KB NOR erase sectors) so embedded `0xABCD` bytes inside record payloads cannot trigger false sector splits; pass `--sector-align 0` only for synthetic/unaligned sub-slices. Output: full record listing (offset, sector sequence, key, flags, LIVE/DEAD, CRC status, value as hex + u32 + ASCII), sector table (with TORN-TAIL flags), the verdict block (§4, emitting `CRC_BAD` if the winner failed CRC), any equal-sequence cross-sector `ambiguities`, and the JSON file with the same fields.
 
-Self-test (no hardware): `python3 kvs_parse.py --selftest` builds synthetic
-sectors (an aborted dead write superseded by live records, a newer sector
-winning over an older one, an empty-value `SsdpUdn`, a tombstone-only key, a
-torn sector tail, an erased sector) and asserts the verdicts. **Result
-2026-10-21: SELFTEST PASS (10/10 checks)**, including alignment auto-detect
-(= 4) and the CRC-bad-still-parsed path. Negative control: run against the
-gotham app image itself, the parser finds 0 sectors and reports all keys
-ABSENT (the descriptor-table strings in rodata do not hallucinate records).
+Self-test (no hardware): `python3 tools/kvs_parse.py --selftest` builds synthetic sectors (an aborted dead write superseded by live records, a newer sector winning over an older one, an empty-value `SsdpUdn`, a tombstone-only key, a torn sector tail, an erased sector, a bad-CRC winning record, an embedded `0xABCD` false-positive test over the CLI `main()` path, and sequence-collision ambiguity surfacing) and asserts the verdicts. Negative control: run against the gotham app image itself, the parser finds 0 sectors and reports all keys ABSENT.
 
 ## 4. Decision table
 
@@ -157,15 +149,11 @@ absent.** A dump landing in a ★ cell closes the property question by the
 physical route; the IsDfDevice column then only decides whether the unit
 was *also* factory-provisioned.
 
-**Bruce transfer** (same table): format, CRC, and winner semantics are
-verified identical in bruce (§1, §2 — FACT). The token column transfers by
-shared design: bruce's unlock is the same TU (challenge string in its
-security struct, same echo memcmp — FACT, bruce USB audit). The narrower
-claim, that bruce's challenge string is likewise seeded from its KVS
-`SsdpUdn` record, was not traced in the bruce audits and remains open.
+**Bruce transfer & unresolved ECDSA discrepancy:** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The echo-token claim (`triage Part 1` / prior `bruce` USB notes: `key_index = 3`, `A OR B`, `echo memcmp` against `SsdpUdn`, `"successful empty-token unlock"`) conflicts with the later `2026-11-13` bulk-channel trace in `README.md` §7.1.1 (which observed `kind 2` requiring an ECDSA P-256 signature over the challenge hash against embedded Google PEM keys). Reconciling whether `key_index == 3` / `A OR B` is a separate factory branch or an obsolete note remains open (see §5 and `README.md` §9 item 6). Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open.
 
 ## 5. What remains open
 
+- Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.
 - The CRC is fully reversed and validated against the firmware's own tables
   (§2); it is **not** yet validated against a genuine on-flash record,
   because no KVS dump exists yet. First real dump = first end-to-end test.

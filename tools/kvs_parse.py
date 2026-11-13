@@ -29,13 +29,18 @@ Usage:
                        --region gap2.bin@0x60424000 \
                        --region tail.bin@0x60C24000 --json result.json
   python3 kvs_parse.py --selftest
-Stdlib only.
+Stdlib only. Default CLI --sector-align is 0x1000 (4 KB NOR erase sectors;
+pass --sector-align 0 for unaligned synthetic blobs).
 """
 
 import argparse
+import contextlib
+import io
 import json
+import os
 import struct
 import sys
+import tempfile
 
 SECTOR_MAGIC = 0xABCD
 RECORD_MAGIC = 0x55AA
@@ -247,44 +252,68 @@ def resolve_winners(records):
                                     "rival_offsets": [r["offset"] for r in rivals]})
     return winners, ambiguities
 
+def _crc_bad_verdict(w):
+    return {
+        "state": "CRC_BAD",
+        "crc_ok": False,
+        "crc_stored": w["crc_stored"],
+        "crc_computed": w["crc_computed"],
+        "raw_live": w["live"],
+        "raw_value_hex": w["value"].hex(),
+        "offset": w["offset"],
+        "detail": "winning record failed CRC-16 check (firmware GetValue rejects with 0xF)",
+    }
+
 def verdicts(winners):
     v = {}
     w = winners.get("IsDfDevice")
-    if w is None or not w["live"]:
+    if w is None:
         v["IsDfDevice"] = {"state": "ABSENT",
-                           "detail": "no live record; compiled default FALSE applies"
-                                     if w is None else
-                                     "latest record is a tombstone; compiled default FALSE applies"}
+                           "detail": "no live record; compiled default FALSE applies"}
+    elif w["crc_stored"] != w["crc_computed"]:
+        v["IsDfDevice"] = _crc_bad_verdict(w)
+    elif not w["live"]:
+        v["IsDfDevice"] = {"state": "ABSENT", "crc_ok": True,
+                           "detail": "latest record is a tombstone; compiled default FALSE applies"}
     else:
         val = u32(w["value"], 0) if len(w["value"]) >= 4 else None
         v["IsDfDevice"] = {"state": "LIVE", "value_u32": val,
                            "bool": (val != 0) if val is not None else None,
-                           "offset": w["offset"]}
+                           "offset": w["offset"], "crc_ok": True}
+
     w = winners.get("SsdpUdn")
-    if w is None or not w["live"]:
+    if w is None:
         v["SsdpUdn"] = {"state": "ABSENT",
-                        "detail": "no live record; firmware generates and stores one at first init"
-                                  if w is None else
-                                  "latest record is a tombstone"}
+                        "detail": "no live record; firmware generates and stores one at first init"}
+    elif w["crc_stored"] != w["crc_computed"]:
+        v["SsdpUdn"] = _crc_bad_verdict(w)
+    elif not w["live"]:
+        v["SsdpUdn"] = {"state": "ABSENT", "crc_ok": True,
+                        "detail": "latest record is a tombstone"}
     else:
         raw = w["value"]
         eff = raw.split(b"\x00", 1)[0]
         if len(eff) == 0:
-            v["SsdpUdn"] = {"state": "EMPTY", "value_len": len(raw), "offset": w["offset"]}
+            v["SsdpUdn"] = {"state": "EMPTY", "value_len": len(raw),
+                            "offset": w["offset"], "crc_ok": True}
         else:
             v["SsdpUdn"] = {"state": "PRESENT", "value": eff.decode("ascii", "replace"),
-                            "value_len": len(raw), "offset": w["offset"]}
+                            "value_len": len(raw), "offset": w["offset"], "crc_ok": True}
+
     w = winners.get("UpdateGauge")
-    if w is None or not w["live"]:
+    if w is None:
         v["UpdateGauge"] = {"state": "ABSENT",
-                            "detail": "no live record; compiled default TRUE applies"
-                                      if w is None else
-                                      "latest record is a tombstone; compiled default TRUE applies"}
+                            "detail": "no live record; compiled default TRUE applies"}
+    elif w["crc_stored"] != w["crc_computed"]:
+        v["UpdateGauge"] = _crc_bad_verdict(w)
+    elif not w["live"]:
+        v["UpdateGauge"] = {"state": "ABSENT", "crc_ok": True,
+                            "detail": "latest record is a tombstone; compiled default TRUE applies"}
     else:
         val = u32(w["value"], 0) if len(w["value"]) >= 4 else None
         v["UpdateGauge"] = {"state": "LIVE", "value_u32": val,
                             "bool": (val != 0) if val is not None else None,
-                            "offset": w["offset"]}
+                            "offset": w["offset"], "crc_ok": True}
     return v
 
 # --------------------------------------------------------------- output ----
@@ -297,7 +326,7 @@ def fmt_value(val):
         parts.append("ascii=%r" % val.decode("ascii"))
     return " ".join(parts)
 
-def render_text(regions, sectors, records, g, verd):
+def render_text(regions, sectors, records, g, verd, ambiguities=()):
     lines = []
     lines.append("KVS parse: %d region(s), %d sector(s), %d record(s), align=%d"
                  % (len(regions), len(sectors), len(records), g))
@@ -324,13 +353,20 @@ def render_text(regions, sectors, records, g, verd):
     lines.append("--- verdicts ---")
     for k in KEYS_OF_INTEREST:
         lines.append("%s: %s" % (k, json.dumps(verd[k], sort_keys=True)))
+    if ambiguities:
+        lines.append("")
+        lines.append("--- ambiguities ---")
+        for a in ambiguities:
+            lines.append("WARNING: key=%r seq=%d winner=0x%08X rivals=%s"
+                         % (a["key"], a["sequence"], a["winner_offset"],
+                            [hex(o) for o in a["rival_offsets"]]))
     bad = [r for r in records if r["crc_stored"] != r["crc_computed"]]
     if bad:
         lines.append("WARNING: %d record(s) with bad CRC (parsed structurally; "
                      "firmware would reject them on full read)" % len(bad))
     return "\n".join(lines)
 
-def to_json(regions, sectors, records, g, verd):
+def to_json(regions, sectors, records, g, verd, ambiguities=()):
     out_records = []
     for r in sorted(records, key=lambda r: r["offset"]):
         try:
@@ -351,7 +387,8 @@ def to_json(regions, sectors, records, g, verd):
             "crc_stored": r["crc_stored"], "crc_computed": r["crc_computed"],
             "crc_ok": r["crc_stored"] == r["crc_computed"],
         })
-    return {"align": g, "sectors": sectors, "records": out_records, "verdicts": verd}
+    return {"align": g, "sectors": sectors, "records": out_records,
+            "verdicts": verd, "ambiguities": list(ambiguities)}
 
 def attach_seqs(sectors, records):
     seq_by_sector = {(s["region"], s["offset"]): s["seq"] for s in sectors}
@@ -460,6 +497,48 @@ def selftest():
     check("distinct sequences resolve cleanly", len(amb_d) == 0 and
           win_d["CollideKey"]["value"] == r_c["value"])
 
+    # Bad-CRC winning record must NOT emit LIVE verdict.
+    bad_win = build_sector(9, 4, [
+        build_record(b"IsDfDevice", u32v(1), live=True, g=g, corrupt_crc=True),
+    ], 512, g)
+    s_bw, r_bw, _ = parse_regions([Region("bw", 0x60940000, bad_win)])
+    attach_seqs(s_bw, r_bw)
+    w_bw, _ = resolve_winners(r_bw)
+    v_bw = verdicts(w_bw)
+    check("bad-CRC winning record emits CRC_BAD verdict",
+          v_bw["IsDfDevice"].get("state") == "CRC_BAD" and
+          v_bw["IsDfDevice"].get("crc_ok") is False)
+
+    # Ambiguities surface in both render_text() and to_json().
+    txt_amb = render_text([region], sectors, records, used_g, verd, amb_c)
+    js_amb = to_json([region], sectors, records, used_g, verd, amb_c)
+    check("ambiguities included in text and JSON outputs",
+          "--- ambiguities ---" in txt_amb and len(js_amb.get("ambiguities", [])) == 1)
+
+    # CLI path enforces default 0x1000 sector_align to ignore embedded 0xABCD bytes.
+    embedded_payload = u32v(1) + b"\xcd\xab\x02\x00\x00\x00\x00\x00" + b"\xff" * 64
+    cli_sec = build_sector(1, 4, [build_record(b"IsDfDevice", embedded_payload, True, g)], 0x1000, g)
+    with tempfile.TemporaryDirectory() as td:
+        dump_path = os.path.join(td, "kvs.bin")
+        json_path = os.path.join(td, "out.json")
+        with open(dump_path, "wb") as fh:
+            fh.write(cli_sec)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_cli = main(["--region", "%s@0x60940000" % dump_path, "--json", json_path])
+        with open(json_path, "r") as fh:
+            cli_out = json.load(fh)
+        check("CLI default sector_align=0x1000 ignores embedded 0xABCD",
+              rc_cli == 0 and len(cli_out["sectors"]) == 1 and
+              cli_out["sectors"][0]["torn"] is False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_raw = main(["--region", "%s@0x60940000" % dump_path,
+                           "--sector-align", "0", "--json", json_path])
+        with open(json_path, "r") as fh:
+            raw_out = json.load(fh)
+        check("CLI --sector-align 0 disables alignment guard",
+              rc_raw == 0 and len(raw_out["sectors"]) == 2 and
+              raw_out["sectors"][0]["torn"] is True)
+
     print("SELFTEST " + ("PASS" if not fails else "FAIL: %s" % ", ".join(fails)))
     return 0 if not fails else 1
 
@@ -475,6 +554,10 @@ def main(argv=None):
                     help="write JSON results to PATH ('-' = stdout, replaces text)")
     ap.add_argument("--align", type=int, choices=ALIGN_CANDIDATES,
                     help="force store granularity instead of auto-detect")
+    ap.add_argument("--sector-align", type=lambda s: int(s, 0), default=0x1000,
+                    metavar="BYTES",
+                    help="required byte alignment for sector headers in NOR dumps; "
+                         "pass 0 to disable (default: 0x1000)")
     ap.add_argument("--selftest", action="store_true",
                     help="build synthetic dumps, parse them back, assert verdicts")
     args = ap.parse_args(argv)
@@ -494,18 +577,19 @@ def main(argv=None):
         with open(path, "rb") as fh:
             regions.append(Region(path, base, fh.read()))
 
-    sectors, records, g = parse_regions(regions, args.align)
+    sector_align = args.sector_align or None
+    sectors, records, g = parse_regions(regions, args.align, sector_align=sector_align)
     attach_seqs(sectors, records)
     winners, ambiguities = resolve_winners(records)
     verd = verdicts(winners)
 
     if args.json == "-":
-        print(json.dumps(to_json(regions, sectors, records, g, verd), indent=2))
+        print(json.dumps(to_json(regions, sectors, records, g, verd, ambiguities), indent=2))
         return 0
-    print(render_text(regions, sectors, records, g, verd))
+    print(render_text(regions, sectors, records, g, verd, ambiguities))
     if args.json:
         with open(args.json, "w") as fh:
-            json.dump(to_json(regions, sectors, records, g, verd), fh, indent=2)
+            json.dump(to_json(regions, sectors, records, g, verd, ambiguities), fh, indent=2)
         print("JSON written to %s" % args.json)
     return 0
 
