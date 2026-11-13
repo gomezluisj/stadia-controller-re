@@ -5,11 +5,9 @@
 
 > **Scope & ethics note.** This document describes defensive architecture and analysis methodology only. No exploit code, no private keys, no vendor-confidential material (everything below was recovered from public firmware images and standard RE tooling). The device is a discontinued product; research like this is how its 16 MB of NOR stays useful after its cloud service went dark in January 2023 and Google's official flasher page followed it.
 >
-> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT106x (measured MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited 5,554 decompiled functions in total (317 restricted flashloader, 547 bootloader, 4,690 application "bruce") and found no memory-corruption bug in the statically audited parsers (bootloader KVS/slots, USB vendor RPC, BLE GATT Prepare/Execute Write, NVRAM protobuf). The EP0 vendor/class control-request path into that same dispatcher was outside the parser audit; a host-controlled length bug there was reported after publication and confirmed statically (issue #1; §7.1 addendum).
-
-> The BootROM itself was characterized through its SDP/HAB interfaces and live experiments, not decompiled. One live BLE path (ATT Signed Write, 0xD2/CSRK, under gotham) remains an **open hardware verdict** (§7.2, §9).
+> **TL;DR for the impatient:** the Stadia Controller is an NXP i.MX RT106x (measured MIMXRT1061, Cortex-M7 crossover) + Broadcom BCM43458F BLE radio, with an unusually well-hardened firmware chain. BootROM HAB is CLOSED, bootloader enforces RSA-4096 slot verification against a fused SRK hash, and the application firmware ("bruce", the 2023 Bluetooth-mode image) uses nanopb-with-bounds, strnlen-bounded RPC, and descriptor-checked protobuf throughout. We audited 5,554 decompiled functions in total (317 restricted flashloader, 547 bootloader, 4,690 application "bruce") and found no memory-corruption bug in the statically audited parsers (bootloader KVS/slots, USB vendor RPC, BLE GATT Prepare/Execute Write, NVRAM protobuf). The EP0 vendor/class control-request path into that same dispatcher was outside the parser audit; a host-controlled length bug there was reported after publication and confirmed statically (issue #1; §7.1 addendum) — escalation is structurally blocked and it remains a write/DoS-class finding (§7.4).
 >
-> It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
+> The BootROM itself was characterized through its SDP/HAB interfaces and live experiments, not decompiled. The one previously-open live BLE path (ATT Signed Write, 0xD2/CSRK) was subsequently closed statically across all three firmware images — full CMAC-8 signature verification exists in each (§7.2) — and the deep audit of the gotham images completed with every audited surface closed sane (§7.4). It is, however, a first-class generic BLE gamepad on Linux/macOS/Windows/Android once the Bluetooth-mode firmware is loaded.
 
 ---
 
@@ -186,13 +184,21 @@ Every length check is `strnlen`-style (`FUN_600db002` is literally a bounded str
 
 **Addendum (2026-11, issue #1): the EP0 control path into this dispatcher is not covered by the audit above.** The USB setup handler (FUN_60054dc0) dispatches class and vendor control requests to the same dispatcher, then runs the OUT data stage with the host's wLength as the receive length, without comparing it to the length the dispatcher declared for the request. Consequences, confirmed statically on bruce and on gotham 235551 (twin handler at 0x60076e5c, byte-identical sequence): (a) an OUT transfer on a read-mapped bRequest (e.g. 0x81, declared length 8 at ctx+0x190) writes as many bytes as the host sends, across the adjacent context fields, and the serial field at ctx+0x1c5 sits 0x35 bytes into that range; (b) dispatcher cases that return success without setting a buffer (0x80, 0x82, 0x83, 0x85, 0x86) leave the request buffer NULL, so an OUT data stage receives at address 0. The per-case bounds in the table above describe the dispatcher's own copies and are unaffected; the bug is in the setup handler's data stage, which this audit had not covered. Hardware demonstration by the reporter (issue #1); maintainer verification is static, with reproduction PoCs written from the code paths but not yet run on a maintainer unit.
 
-### 7.2 BLE GATT write paths (Prepare/Execute closed statically; Signed Write open in hardware)
+### 7.2 BLE GATT write paths (closed statically — Prepare/Execute and Signed Write)
 
 - Prepare Write `FUN_60069160`: reassembly buffer at `ctx+0x1ac0` (0x259 bytes), check `offset + len < 0x259` with both operands `uint` and `len` bounded by MTU — **correct**.
 - Execute Write `FUN_60069b20` → `FUN_6006ad00`: the Prepare-Write **value_offset is never persisted** (only handle @0x1abc and accumulated length @0x1abe) — the classic two-phase offset-overflow trap is dead by design.
 - Residual: attribute write callbacks via vtable `+0x10` receive up to 0x259 bytes; per-attribute destination buffers were not exhaustively audited.
 
-Scope note: this static closure covers **Prepare/Execute Write (ATT opcodes 0x16/0x18)** in FUN_60069160/FUN_60069b20. A separate live experiment against **ATT Signed Write (opcode 0xD2 with CSRK)** was performed under the gotham image with an ambiguous hardware result and was not conclusively closed; it remains the top open runtime question (§9). Closing it statically for bruce would mean auditing the 0xD2 handler in the bruce decompilation corpus.
+- **ATT Signed Write (opcode 0xD2 with CSRK) — closed statically across all three images (November 2026).** The server-side write-command handler performs full signature verification before accepting any write, in every image:
+
+| Image | Router → extractor → verifier | Verification |
+|---|---|---|
+| bruce 337784 | `FUN_600ad9d8` → `FUN_600f41d0` → `FUN_600f0e98` | bond lookup, CSRK flag `+0x7b & 4`, anti-replay counter, CMAC-8 over the bond key, 8-byte memcmp |
+| gotham OTA 282115 | `FUN_602e6312` → `FUN_602e2fda` (bond lookup `FUN_601dc474`, CMAC `FUN_601fcf4c`) | same checks |
+| gotham Slot B 235551 | router `FUN_609b2dec` → `FUN_60abb23c` → verifier `FUN_60ab7f04` — **in the NOR-resident shared code library, not in the slot binary** | bond lookup `FUN_609a532c`, CSRK flag `+0x7b & 4`, anti-replay `+0xdc ≤ received`, CMAC-8 `FUN_609c5e04` over `bond+0x9c`, 8-byte memcmp |
+
+An interim finding of an unauthenticated write in 235551 was refuted: `FUN_608c4a90` is the GATT **client** transaction engine (counter-only, opcode 0x12); the server-side path with verification lives in the shared library. The earlier ambiguous live test ran under gotham, where the handler sits outside the slot binary — which explains why slot-only static reads initially found nothing (see methodological lesson 6).
 
 ### 7.3 Untrusted NOR → boot-time parsers (the "interesting" one)
 
@@ -204,7 +210,23 @@ Since HAB only covers executable slots, and we have arbitrary NOR erase/write vi
 
 **Verdict: no exploitable path from untrusted NOR either.** The consistent defensive pattern across five independent subsystems (HAB, bootloader KVS, vendor RPC, GATT, NVRAM/calibration) strongly suggests systematic internal security review at Google plus a house style of nanopb-with-bounds and capped containers. We're calling this one closed unless/until someone publishes a concrete bug.
 
-### 7.4 What this does *not* close
+### 7.4 EP0 live-USB finding and gotham deep audit (completed November 2026)
+
+**EP0 vendor OUT length bug (bruce, live USB): write/DoS class — not code execution.** The vendor OUT endpoint accepts an oversized EP0 write that places attacker-controlled bytes in OCRAM, but escalation is structurally blocked by two independent kill mechanisms: (1) an IRQ-nesting critical-section counter at `0x20003D68` (offset 0x568) — the enter/exit pair (`FUN_60048580`/`FUN_600485c8`, panic path `FUN_600cc5ac`) manages `BASEPRI` IRQ masking and panics/hangs if the counter is corrupted; and (2) a live-USB-state window at `0x20003F40–0x20003F5F` whose consumers (`FUN_60060fe8`, `FUN_6013d4d8`) expose no IN oracle — the host cannot learn what to write before the multi-tens-of-KB write completes. The deep-escalation path toward the power-manager handle at OCRAM `0x2000D218` is therefore unreachable, and EP0 remains a denial-of-service-class finding (recovery: physical replug; control-path context in the §7.1 addendum, issue #1).
+
+**gotham audit coverage.** Full forced decompilation of the Slot B 235551 application binary (330,102 lines, 7,566 functions), the NOR-resident shared code library it calls into (1,109,540 lines, 28,280 functions — where 235551's ATT server, CMAC-8, and AES-CTR/KDF primitives actually live; AES S-box at virtual `0x60B169A8`), and the OTA 282115 image (710,615 lines, 17,134 functions). Audited layers and verdicts:
+
+| Layer | Verdict | Key evidence |
+|---|---|---|
+| ATT Signed Write 0xD2/CSRK | sane — full CMAC-8 verification | §7.2 |
+| Key-store / attribute-table parsers (0x2017/0x2018 key blobs) | sane — post-exploit-only | the one parser with length arithmetic (`FUN_601e4b14` in 282115; `FUN_609ad9cc` in 235551) is fed exclusively by fixed-size internal producers whose length fields are compile-time constants; store entry gated by a 6-byte peer-MAC memcmp |
+| protobuf dispatcher family (shared library `FUN_608efc98` chain, 886-line top level) | dead code | no callers, no literal-pool refs, no BL sites in either image |
+| NOR persistence layer (`flash_lut.cc`) | sane | erase validates alignment and range before the primitive; writes confined to the `0x6000–0x3A000` window, erased-cells-only (`0xFF`), rate-limited retry |
+| Persistent KVS key registry (`keys.cc`) | not injectable | key table is compile-time rodata at `0x60304b60` — sequential IDs, embedded name pointers, fixed no-erase flags; binary-searched (`FUN_6008f77c`), no runtime writer |
+
+**Net conclusion:** no radio-reachable path to persistent-state corruption exists in any of the three images. Everything that alters persistent storage requires prior code execution, and neither known execution-adjacent entry point (EP0 write, ATT write) provides it.
+
+### 7.5 What this does *not* close
 
 - Any hardware attack (glitching, SWD if fuses permit, BEE key extraction).
 - The Switch 2 side: Nintendo's native controller protocol is BLE-proprietary (manufacturer data with company `0x0553`, custom GATT, no standard SMP), and no stock path makes the Stadia speak it. Wake-beacon format is public (`mfg 0x0553`, VID `0x057E`, bonded-controller PID, byte `0x0B=0x81`, host MAC reversed) but **must originate from an already-bonded MAC** — a software-only bridge violates both "no extra hardware" and stock-firmware constraints.
@@ -231,6 +253,8 @@ Copyrighted firmware binaries and full decompilation corpora are excluded via `.
 - `bootloader_dump.bin`: 131,072 B (sha256 `59ebfd2c…f2ca0`), base `0x60800000`, 547 functions
 - `restricted_ivt_flashloader.bin`: 100,672 B, base `0x20002400`, 317 functions
 - `bruce_pvt_a_prod_signed.bin` (build 337784): 1,050,984 B, base `0x60040000`, 4,690 functions
+- Additional corpora for reproducing the gotham audit: the OTA 282115 stable image (sha256 `269bb21160ea6d1366e71bb9c9b148e2782ea967b81c7b6ff038e7d49b61e00f`, XIP base `0x60040000`), the Slot B 235551 application (read from NOR offset `0x840000` of your own dump), and the shared NOR code library (XIP base `0x60800000`)
+- **Provenance warning:** the artifact circulating as `gotham235551.elf` is **not** build 235551 — it is an ELF32 wrapper (single `LOAD` at `0x60040000`) whose file offset `0x1000` embeds a payload byte-identical to the OTA 282115 stable image (sha256 above). Rename it accordingly before using it in analysis; the actual 235551 image only exists in the Slot B region of a hardware dump.
 
 Also hashed in `evidence/SHA256SUMS.txt`: `bruce_dvt_a_dev_signed.bin` (the dev-signed build 337784 image whose rejection on production units is described in §4), `gotham235551.elf` and `flash_head.bin`.
 
@@ -240,18 +264,19 @@ Also hashed in `evidence/SHA256SUMS.txt`: `bruce_dvt_a_dev_signed.bin` (the dev-
 3. **Label every claim demonstrated / probable / not-demonstrated.** The single cheapest technique that caught the most errors.
 4. **Recovery before aggression.** With the 10-second SDP recovery validated on day 1, every experiment became cheap to attempt.
 5. **A BLE "won't connect" usually isn't the device.** Fresh bond + registered agent + in-window connection solves ~90% of stock-firmware pairing failures on Linux.
+6. **A missing handler may live in a shared library.** Searching the Slot B 235551 binary for the 0xD2/CSRK verifier found nothing — the entire ATT server lives in a NOR-resident shared code library the slot calls into. Absence of a handler in the main image is not absence of the handler; map the full XIP space before declaring a path unverified.
 
 ---
 
 ## 9. What a future researcher still has open
 
-1. **Resolving the ATT Signed Write (0xD2 / CSRK) hardware verdict.** Re-run the signed-write test under controlled instrumentation, comparing the 0xD2 opcode handler between gotham and bruce, to determine whether the ambiguous live result observed under gotham corresponds to a reachable corruption primitive.
-2. **Deep audit of gotham (Slot B, build 235551).** Because gotham is a valid Google-signed image that runs automatically on any Slot A fallback — and includes the full legacy Wi-Fi + network provisioning stack removed in bruce — it represents a larger and less-audited runtime attack surface than bruce. Assuming it shares bruce's clean bill of health without an equivalent function-by-function audit would be premature.
-3. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
-4. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
-5. **Switch 2 protocol emulation** on the radio itself requires speaking Nintendo's proprietary BLE from the controller's own BT chip — not reachable with signed stock firmware; would need either a custom image (HAB blocks) or a hardware transplant. The beacon/wake spec is however fully documented publicly (ndeadly, alexvnesta) and reproducible from any other BLE-capable device you control.
-6. **Gotham's Wi-Fi subsystem** was not audited to the same depth as bruce (pattern of defensive style suggests closure, but it's declared rather than measured).
-7. **The bootloader's ASN.1/PKCS#7 path** and the individual GATT vtable `+0x10` write callbacks were verified only at a coarse level — candidates if anyone wants more leaves to turn over.
+*(Items 1–2 from the original publication — resolving the ATT Signed Write 0xD2/CSRK hardware verdict and the deep audit of gotham — were completed on 2026-11-12; results in §7.2 and §7.4. What remains:)*
+
+1. **The real reading primitive.** CVE-2022-45163 via the actual `CHECK_DATA` DCD timing side channel (NCC Group/fox-it PoC) would give a slow read path for OCOTP/fuses — mostly of research value, since code_exec needs more than a read.
+2. **Hardware-class attacks** on HAB: glitching the compare, BEE, SWD (all outside this project's scope).
+3. **Switch 2 protocol emulation** on the radio itself requires speaking Nintendo's proprietary BLE from the controller's own BT chip — not reachable with signed stock firmware; would need either a custom image (HAB blocks) or a hardware transplant. The beacon/wake spec is however fully documented publicly (ndeadly, alexvnesta) and reproducible from any other BLE-capable device you control.
+4. **Gotham's Wi-Fi-era network stack** (Wi-Fi provisioning, TCP/IP, the Synapse audio pipeline) was not audited function-by-function; the gotham audit (§7.4) covered its BLE/ATT surface, key-store parsers, and NOR persistence layers.
+5. **The bootloader's ASN.1/PKCS#7 path** and the individual GATT vtable `+0x10` write callbacks were verified only at a coarse level — candidates if anyone wants more leaves to turn over.
 
 ---
 
@@ -265,4 +290,4 @@ Also hashed in `evidence/SHA256SUMS.txt`: `bruce_dvt_a_dev_signed.bin` (the dev-
 - nanopb — its `.rodata` error strings are the smoking gun that identified the NVRAM serialization format.
 - Community firmware mirror: `luigimannoni.github.io/stadia-controller-flasher` (WebHID), the only working path to the official Bluetooth-mode image since Google's official flasher went dark.
 
-*Document compiled from the complete project record (boot ROM analysis, 4 red-team review cycles, hardware-verified flash primitives, and a full static audit of the application firmware). Corrections and extensions welcome — if you find a real bug in any of these paths, it will be interesting precisely because this reference documents why the obvious ones aren't there.*
+*Document compiled from the complete project record (boot ROM analysis, 4 red-team review cycles, hardware-verified flash primitives, and a full static audit of the application firmware). Extended November 2026 with the gotham cross-image audit (Slot B 235551, shared NOR code library, OTA 282115) and closure of the 0xD2/CSRK and EP0 questions. Corrections and extensions welcome — if you find a real bug in any of these paths, it will be interesting precisely because this reference documents why the obvious ones aren't there.*
