@@ -149,11 +149,11 @@ absent.** A dump landing in a ★ cell closes the property question by the
 physical route; the IsDfDevice column then only decides whether the unit
 was *also* factory-provisioned.
 
-**Bruce transfer & unresolved ECDSA discrepancy:** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The echo-token claim (`triage Part 1` / prior `bruce` USB notes: `key_index = 3`, `A OR B`, `echo memcmp` against `SsdpUdn`, `"successful empty-token unlock"`) conflicts with the later `2026-11-13` bulk-channel trace in `README.md` §7.1.1 (which observed `kind 2` requiring an ECDSA P-256 signature over the challenge hash against embedded Google PEM keys). Reconciling whether `key_index == 3` / `A OR B` is a separate factory branch or an obsolete note remains open (see §5 and `README.md` §9 item 6). Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open.
+**Bruce transfer & resolved dual-path reconciliation (2026-11-13):** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The earlier echo-token observation (`triage Part 1`: `key_index = 3`, `A OR B` gate, echo memcmp against `SsdpUdn`, "successful empty-token unlock") and the later ECDSA trace in `README.md` §7.1.1 are **both real — they are the two branches of the same unlock handler** (disasm `0x60077d92`): the `(reg 0x26 bit-8-inverted service combo OR IsDfDevice)` gate selects an echo-memcmp path (challenge `strlen`+`memcmp`; a SsdpUdn-less unit yields an empty challenge, hence the empty-token success), and only when that gate fails does kind 2 fall through to ECDSA P-256 verification against Google's embedded PEM keys. Full path detail in `README.md` §7.1.1; §9 item 6 closed. Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open (§4 evidence: the challenge buffer is populated from OCRAM `0x2000d1d5`, whose provenance — KVS seed vs runtime generation — is unconfirmed).
 
 ## 5. What remains open
 
-- Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.
+- ~~Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.~~ **Resolved 2026-11-13: dual-path unlock confirmed in disassembly** — echo-memcmp behind the service-combo/DF gate, ECDSA P-256 as the fallback for end-user units.
 - The CRC is fully reversed and validated against the firmware's own tables
   (§2); it is **not** yet validated against a genuine on-flash record,
   because no KVS dump exists yet. First real dump = first end-to-end test.
