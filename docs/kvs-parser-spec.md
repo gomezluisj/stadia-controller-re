@@ -125,14 +125,19 @@ OCOTP silicon fuse field `0x26` bit 8 (in bruce: `FUN_600d9934` →
 `FUN_60071348(0x26)` → ITCM `FUN_00001084(0x401F4000, 0x26, &out, 4)` reading
 the i.MX RT1060 OCOTP controller at `0x401F4000`, rather than a companion-chip
 button-combo register as earlier notes assumed), and **B** = the dynamic
-`IsDfDevice` value (KVS key `0x16`, falling back to the compiled default FALSE
-when no live record exists; enumerating all `FUN_60101198` / `0x600d7140..0x600d7250`
-writers in bruce shows no firmware path writes key `0x16`). `key_index = 3` in
-a challenge response ⟺ the condition was true at that moment. A KVS dump can
-only ever show B directly; A is decided by elimination. The echo token is
-compared against the unit's challenge string, which is its `SsdpUdn` value
-(FACT for gotham: the challenge field is device_info's `SsdpUdn`, initialized
-from KVS key 4; a stored empty value suppresses regeneration — the generator
+`IsDfDevice` value (config ID `0x16` passed to `FUN_600d72ec(0x16, …)` — the
+compile-time enum index in `keys.cc` that resolves to the ASCII flash key
+`"IsDfDevice"`, falling back to the compiled default FALSE when no live record
+exists; enumerating all `FUN_60101198` / `0x600d7140..0x600d7250` writers in
+bruce shows no firmware path writes key `0x16`). `key_index = 3` in a challenge
+response ⟺ the condition was true at that moment. A KVS dump can only ever
+show B directly; A is decided by elimination. The echo token is compared
+against the unit's challenge string (`SsdpUdn` / OCRAM `0x2000d1d5`): in
+`bruce`, Route A (`0x60077d98..0x60077dae`) compares the token directly against
+the static `0x2000d1d5` string (`strlen` + `memcmp`), whereas the runtime
+counter appended at `ctx+0x1380` is consumed by the Route B ECDSA SHA-256
+digest (FACT for gotham: `device_info`'s `SsdpUdn` is initialized from KVS
+key 4; a stored empty value suppresses regeneration — the generator
 `FUN_600836B0` fires only when the key is *not found*, initializer
 `FUN_60083968`).
 

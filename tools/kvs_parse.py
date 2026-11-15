@@ -245,7 +245,8 @@ def resolve_winners(records):
         if cands and len(cands) > 1:
             top = max(cands, key=lambda r: (r["_sector_seq"], r["offset"]))
             rivals = [r for r in cands if r is not top
-                      and r["_sector_seq"] == top["_sector_seq"]]
+                      and r["_sector_seq"] == top["_sector_seq"]
+                      and r.get("sector_offset") != top.get("sector_offset")]
             if rivals:
                 ambiguities.append({"key": key, "sequence": top["_sector_seq"],
                                     "winner_offset": top["offset"],
@@ -461,6 +462,15 @@ def selftest():
     tk = winners.get("TombKey")
     check("TombKey winner is the tombstone (reads absent)",
           tk is not None and tk["live"] is False)
+    check("same-sector updates do not trigger ambiguity (2-sector walk)",
+          len(ambiguities) == 0)
+
+    # Multiple updates to the same key within the winning sector alone -> no ambiguity
+    s_same, r_same, _ = parse_regions([Region("selftest-same", 0x60F00000, sec1)])
+    attach_seqs(s_same, r_same)
+    w_same, amb_same = resolve_winners(r_same)
+    check("multiple records for same key in single winning sector -> no ambiguity",
+          len(amb_same) == 0 and w_same["IsDfDevice"]["live"] is True)
 
     # CRC-failure path: corrupt one value byte, record must still parse.
     bad = bytearray(blob)
@@ -483,15 +493,21 @@ def selftest():
           all(s["offset"] != 0x60F00000 + ins for s in sectors_fp))
 
     # sector_sequence collision across distinct sectors -> ambiguity flag
-    def fake_rec(key, value, seq, off):
+    def fake_rec(key, value, seq, off, sec_off=None):
         return {"key_bytes": key, "value": value, "live": True,
                 "_sector_seq": seq, "offset": off,
+                "sector_offset": off if sec_off is None else sec_off,
                 "crc_stored": 0, "crc_computed": 0}
     r_a = fake_rec(b"CollideKey", b"AAAA", 7, 0x100)
     r_b = fake_rec(b"CollideKey", b"BBBB", 7, 0x300)  # same seq, other sector
     win_c, amb_c = resolve_winners([r_a, r_b])
     check("sequence collision flagged ambiguous", len(amb_c) == 1 and
           amb_c[0]["key"] == "CollideKey")
+    r_same_a = fake_rec(b"SameSecKey", b"AAAA", 7, 0x110, sec_off=0x100)
+    r_same_b = fake_rec(b"SameSecKey", b"BBBB", 7, 0x130, sec_off=0x100)
+    win_sc, amb_sc = resolve_winners([r_same_a, r_same_b])
+    check("same-sector equal sequence resolves cleanly without ambiguity",
+          len(amb_sc) == 0 and win_sc["SameSecKey"]["value"] == b"BBBB")
     r_c = fake_rec(b"CollideKey", b"CCCC", 8, 0x900)  # higher seq wins cleanly
     win_d, amb_d = resolve_winners([r_a, r_c])
     check("distinct sequences resolve cleanly", len(amb_d) == 0 and
