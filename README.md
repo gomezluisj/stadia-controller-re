@@ -307,6 +307,7 @@ Also hashed in `evidence/SHA256SUMS.txt`: `bruce_dvt_a_dev_signed.bin` (the dev-
 
 ## 10. Credits & pointer material
 
+- X-15 (`github.com/X-15`, issues #1 and #3) — live-USB discovery and readback verification of the EP0 vendor OUT `wLength` overflow and NULL-buffer ITCM DMA (§7.1 addendum), the `0x8b` bulk-arming lead (issue #2), HID Report `0x05` rumble layout, OCOTP fuse-read resolution for `FUN_600d9934` / `FUN_600d995c` via `FUN_00001084` (§7.1.1), `bruce` KVS `0x16` writer audit, and the i.MX RT1060 mask BootROM field-return / CSF `WRITE_DATA` allowlist audit (§4).
 - GaryOderNichts — original Stadia Controller flashloader reverse engineering and `stadiatool` (2023, github.com/GaryOderNichts/StadiaController), which first documented the FlexSPI register access path in Google's restricted flashloader.
 - lidskialf.net (Andrew de Quincey) — hardware teardown of the Stadia Controller PCB that physically identified the SoC as NXP i.MX RT1061.
 - NXP i.MX RT1060 RM (BootROM/HAB chapters), `fsl_flexspi` SDK sources, u-boot `hab.h` — for ROM contract identification.
