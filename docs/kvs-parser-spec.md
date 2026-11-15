@@ -119,15 +119,20 @@ Self-test (no hardware): `python3 tools/kvs_parse.py --selftest` builds syntheti
 
 ## 4. Decision table
 
-Background (FACT, triage Part 1): the vendor echo condition in gotham is
-`A OR B`, where **A** = companion-chip mailbox register 0x26, inverted bit 8,
-and **B** = the dynamic `IsDfDevice` value (falling back to the compiled
-default FALSE when no live record exists). `key_index = 3` in a challenge
-response ⟺ the condition was true at that moment. A KVS dump can only ever
-show B directly; A is decided by elimination. The echo token is compared
-against the unit's challenge string, which is its `SsdpUdn` value (FACT for
-gotham: the challenge field is device_info's `SsdpUdn`, initialized from KVS
-key 4; a stored empty value suppresses regeneration — the generator
+Background (FACT, triage Part 1; leg A clarified 2026-11-15 via issue #3):
+the vendor echo condition in gotham/bruce is `A OR B`, where **A** = on-chip
+OCOTP silicon fuse field `0x26` bit 8 (in bruce: `FUN_600d9934` →
+`FUN_60071348(0x26)` → ITCM `FUN_00001084(0x401F4000, 0x26, &out, 4)` reading
+the i.MX RT1060 OCOTP controller at `0x401F4000`, rather than a companion-chip
+button-combo register as earlier notes assumed), and **B** = the dynamic
+`IsDfDevice` value (KVS key `0x16`, falling back to the compiled default FALSE
+when no live record exists; enumerating all `FUN_60101198` / `0x600d7140..0x600d7250`
+writers in bruce shows no firmware path writes key `0x16`). `key_index = 3` in
+a challenge response ⟺ the condition was true at that moment. A KVS dump can
+only ever show B directly; A is decided by elimination. The echo token is
+compared against the unit's challenge string, which is its `SsdpUdn` value
+(FACT for gotham: the challenge field is device_info's `SsdpUdn`, initialized
+from KVS key 4; a stored empty value suppresses regeneration — the generator
 `FUN_600836B0` fires only when the key is *not found*, initializer
 `FUN_60083968`).
 
@@ -144,16 +149,16 @@ including tombstone-latest; compiled default FALSE applies).
 ★ = the two cells consistent with everything observed on this unit so far
 (key_index=3 across boots, challenge response carrying no string, and the
 successful empty-token unlock): **SsdpUdn stored EMPTY, the echo condition
-carried by leg A (companion register), IsDfDevice either explicitly 0 or
+carried by leg A (OCOTP fuse `0x26` bit 8), IsDfDevice either explicitly 0 or
 absent.** A dump landing in a ★ cell closes the property question by the
 physical route; the IsDfDevice column then only decides whether the unit
 was *also* factory-provisioned.
 
-**Bruce transfer & resolved dual-path reconciliation (2026-11-13):** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The earlier echo-token observation (`triage Part 1`: `key_index = 3`, `A OR B` gate, echo memcmp against `SsdpUdn`, "successful empty-token unlock") and the later ECDSA trace in `README.md` §7.1.1 are **both real — they are the two branches of the same unlock handler** (disasm `0x60077d92`): the `(reg 0x26 bit-8-inverted service combo OR IsDfDevice)` gate selects an echo-memcmp path (challenge `strlen`+`memcmp`; a SsdpUdn-less unit yields an empty challenge, hence the empty-token success), and only when that gate fails does kind 2 fall through to ECDSA P-256 verification against Google's embedded PEM keys. Full path detail in `README.md` §7.1.1; §9 item 6 closed. Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open (§4 evidence: the challenge buffer is populated from OCRAM `0x2000d1d5`, whose provenance — KVS seed vs runtime generation — is unconfirmed).
+**Bruce transfer & resolved dual-path reconciliation (2026-11-13; fuse backing updated 2026-11-15):** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The earlier echo-token observation (`triage Part 1`: `key_index = 3`, `A OR B` gate, echo memcmp against `SsdpUdn`, "successful empty-token unlock") and the later ECDSA trace in `README.md` §7.1.1 are **both real — they are the two branches of the same unlock handler** (disasm `0x60077d92`): the `(OCOTP fuse 0x26 bit 8 OR IsDfDevice)` gate selects an echo-memcmp path (challenge `strlen`+`memcmp`; a SsdpUdn-less unit yields an empty challenge, hence the empty-token success), and only when that gate fails does kind 2 fall through to ECDSA P-256 verification against Google's embedded PEM keys. Full path detail in `README.md` §7.1.1; §9 item 6 closed. Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open (§4 evidence: the challenge buffer is populated from OCRAM `0x2000d1d5`, whose provenance — KVS seed vs runtime generation — is unconfirmed).
 
 ## 5. What remains open
 
-- ~~Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.~~ **Resolved 2026-11-13: dual-path unlock confirmed in disassembly** — echo-memcmp behind the service-combo/DF gate, ECDSA P-256 as the fallback for end-user units.
+- ~~Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.~~ **Resolved 2026-11-13; fuse backing closed 2026-11-15 (issue #3):** dual-path unlock confirmed in disassembly — echo-memcmp behind the `(OCOTP fuse 0x26 bit 8 via FUN_00001084 @ 0x401F4000 OR IsDfDevice)` gate (with no `bruce` writer for KVS key `0x16`), and ECDSA P-256 as the fallback for end-user units.
 - The CRC is fully reversed and validated against the firmware's own tables
   (§2); it is **not** yet validated against a genuine on-flash record,
   because no KVS dump exists yet. First real dump = first end-to-end test.
