@@ -1,6 +1,6 @@
 # Evidence directory
 
-No copyrighted firmware binaries are hosted here — only hashes, console excerpts, and raw-capture summaries that let a third party check claims against their own dumps (`sha256sum -c SHA256SUMS.txt` on the files you extract; note byte lengths are listed only for 3 of the 6 artifacts, and no full 16 MB NOR or KVS partition hash is present yet).
+No copyrighted firmware binaries are hosted here — only hashes, console excerpts, and raw-capture summaries that let a third party check claims against their own dumps (`sha256sum -c SHA256SUMS.txt` on the files you extract; note byte lengths are listed for 6 of the 8 artifacts, and no full 16 MB NOR or KVS partition hash is present yet).
 
 | File | Claim it supports |
 |---|---|
