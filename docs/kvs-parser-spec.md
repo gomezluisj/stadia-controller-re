@@ -12,19 +12,17 @@ unless marked bruce (also based at `0x60040000`; on-NOR Slot B 235551 starts at
 
 ## 1. Format as implemented
 
-### Sector header (16 B) — FACT (triage Part 2; mount FUN_6020415E)
-- `+0x00` u16 magic `0xABCD`; `+0x02` u16 version, accepted 2..4.
-- `+0x04..+0x07` metadata bytes, semantics undetermined; the parser reports
-  them raw in the JSON (`meta_4_7`) and does not interpret them.
-- `+0x08` u64 sequence (LE): the sector generation counter. The mount keeps,
-  per key, the record from the sector with the highest sequence.
-- Records start at sector + 16. Sector size is **not** needed by the parser:
-  sectors are located by scanning for headers and delimited by the next
-  accepted header or the end of the region. An erased sector is all-`0xFF`
-  and has no valid header, so it never appears as a sector.
+### Sector header (`2 * align(8)` bytes: 16 B when `g <= 8`, 32 B when `g = 16`) — FACT (`gotham FUN_6020415E`, `bruce Mount 0x600cb6fc`)
+- **Chunk 0 (`+0x00 .. +align(8)-1`, `16 B` on BEE partitions with `g = 16`):**
+  - `+0x00` u16 magic `0xABCD`; `+0x02` u16 version, accepted `2..4`.
+  - `+0x04` u16 **granularity `g`** (verified at `0x600cb89c` in `bruce Mount`: when `version == 2`, firmware forces `sector_g = 1`; when `version in (3, 4)`, firmware checks `[sector+0x04]` equals the store's `this+0x59` byte granularity `g`, including `16` on BEE-encrypted NOR partitions).
+  - `+0x06..+0x07` u16 reserved/metadata (plus zero/chunk padding up to `align_up(g, 8)` bytes).
+- **Chunk 1 (`+align(8) .. +2*align(8)-1`, `+0x10..+0x1f` when `g = 16`):**
+  - `+align(8)` u64 `sequence` (LE): the sector generation counter. `Mount` reads `Chunk 1` separately (`0x600cb830..0x600cb92c`): if `Chunk 1` is completely erased (`0xFF`), firmware assigns `sequence = 0xFFFFFFFFFFFFFFFF` (active unsealed sector accepting appends, or freshly formatted standby sector).
+- **Records start at `sector + 2 * align_up(g, 8)`** (`+0x10` when `g <= 8`, `+0x20` when `g = 16`). Sector size is **not** needed by the plaintext parser: sectors are located by scanning `0x1000`-aligned offsets for `0xABCD` headers and delimited by the next accepted header or region end.
 
 ### Record (FACT unless noted)
-Header 8 B:
+Header 8 B (padded to `align_up(g, 8)` bytes; `16 B` when `g = 16`):
 - `+0x00` u16 magic `0x55AA`
 - `+0x02` u16 CRC (see §2)
 - `+0x04` u16 flags; **bit 0 = record NOT live** (tombstone / pending-delete
@@ -35,12 +33,18 @@ Header 8 B:
 Body: key (ASCII name) at `record + align(8)`; value at
 `record + align(8) + align(key_len)`; total size
 `align(8) + align(key_len) + align(value_len)` — align helper `FUN_602E2D6C`
-(round up to a multiple), size helper `FUN_602E2DB2`, read path `FUN_60203EA0`
-(GetValue). **Alignment granularity** is a runtime byte of the store object
-(+0x59) whose concrete value is not statically fixed (triage open item;
-probably 4 — INFERENCE). The parser auto-detects it: it walks the dump with
-each candidate in {4, 1, 2, 8} and keeps the walk scoring highest on
-(CRC-valid records, clean sectors, record count). `--align N` overrides.
+(`0x60100b24` in `bruce`), size helper `FUN_602E2DB2` (`0x60100b6a` in `bruce`,
+verified 3-chunk layout for all `g` including `g = 16`), read path `FUN_60203EA0`
+(`GetValue`). **Alignment granularity `g`** is queried from the underlying
+partition driver (`vtable+0x10` at `0x600cb72e`) and stored at `this+0x59`:
+plaintext NOR drivers use `g in {1, 2, 4, 8}`, while the BEE-encrypted
+internal flash driver enforces `g = 16` (`0x6005f320..0x6005f326`) so every
+chunk (`Chunk 0`, `Chunk 1`, record header, key, and value) occupies a multiple
+of the 16-byte AES-128 block. The parser auto-detects `g` across
+`{4, 1, 2, 8, 16}` scored by CRC hits and header granularity (`--align N`
+overrides). On raw FlexSPI NOR dumps inside `0x006000..0x03ffff` (ciphertext),
+`detect_bee_sectors()` classifies 4 KiB sector occupancy structurally by
+16-byte blocks (`standby_formatted`, `active_no_seq`, `active_sequenced`).
 
 ### Winner resolution — FACT (mount FUN_6020415E + GetValue FUN_60203EA0)
 Per key, the firmware's RAM index keeps the record with the highest
@@ -95,27 +99,108 @@ never an abort, while `verdicts()` flags any bad-CRC winner as
 `state="CRC_BAD"` (`crc_ok=false`, mirroring firmware `GetValue` rejecting
 with `0xF`) instead of trusting it as `"LIVE"`.
 
-**Still untested**: no genuine on-flash KVS record has ever been parsed (no
-NOR dump of the KVS region exists yet). The CRC is proven against the
-firmware's own tables and the catalogue check value, and the parser
-end-to-end against synthetic data (§3), but the first real dump is the
-first end-to-end test against a real record. If that dump yields zero
-CRC-valid records under every alignment, stop and revisit §1/§2 before
-drawing verdicts.
+**Hardware session verification (2026-11-15):** live hardware inspection of a
+PVT `bruce 337784` unit revealed why raw FlexSPI NOR dumps of
+`0x006000..0x03ffff` show no plaintext `0xABCD`/`0x55AA` markers: that entire
+`0x3a000`-byte writable range is hardware-encrypted on flash via **i.MX RT106x
+BEE Region 1 (`AES-128-ECB`)**, with `g = 16` (`0x10`) granularity (§3.1). On
+live app mode (`18d1:9400`), reading `transfer_bug_report` (Bulk `op=9`)
+already yields decrypted `BootloaderKvsMetadata` strings written through the
+CPU/AHB BEE bus window (`AppAMeta`/`AppBMeta` Verified, `BookkeepMeta:
+active=1, backup=2`), whose active/standby sector layout matches the
+16-byte ciphertext blocks observed on raw NOR to the byte. Plaintext CRC-16
+parsing remains ready whenever decrypted KVS slices (or unencrypted dev
+regions) are supplied.
 
-## 3. Parser usage (hardware session)
+## 3. Partition discovery & parser usage (hardware session)
 
-Feed it every region file with the NOR address of its first byte:
+### 3.1 Resolved 13-partition table in NOR Flash — FACT (`bruce 337784` & `gotham 316382`)
+
+Static disassembly of the board partition-table constructor in **`bruce` (`337784`)**
+(`0x600740e2..0x60074580` on board singleton `0x200064c0`, registering `0x0d = 13`
+descriptors in `board + 0x4378` via `0x600717a0`, constructing KVS instances via
+`0x600d9c0a`) and the identical table in **`gotham` (`316382`)** (file offset
+`0x6f764..0x6fade`, XIP `0x608af764..0x608afade`) resolves the physical NOR
+offsets of all 13 firmware partitions plus Sector 0 (`FCB`), spanning all
+4,096 × 4 KiB sectors (`16 MiB`) with zero unmapped gaps:
+
+| 4 KiB sectors | Physical NOR | XIP address | Size | ID (`+0x08`) | KVS flags (`+0x09/+0x0a`) | Verified role |
+|---|---|---|---:|---|---|---|
+| `0x000..0x000` | `0x000000–0x000fff` | `0x60000000–0x60000fff` | 4 KiB | *(FCB)* | — | FlexSPI Configuration Block (`"FCFB"`) |
+| `0x001..0x001` | `0x001000–0x001fff` | `0x60001000–0x60001fff` | 4 KiB | `0x12` (`18`) | `0, 0` | Boot IVT + `boot_data` read by Mask ROM (`board+0x4384`) |
+| `0x002..0x003` | `0x002000–0x003fff` | `0x60002000–0x60003fff` | 8 KiB | `0x07` (`7`) | `0, 0` | Secondary crash / bug report store (`board+0x6740`, below write window) |
+| `0x004..0x005` | `0x004000–0x005fff` | `0x60004000–0x60005fff` | 8 KiB | `0x0a` (`10`) | `0, 0` | Protected low partition (`board+0x4460`, below write window) |
+| `0x006..0x027` | `0x006000–0x027fff` | `0x60006000–0x60027fff` | 136 KiB | `0x08` (`8`) | `0, 0` | Primary bug report / crash tombstone store (`bug_report.cc`) |
+| `0x028..0x02f` | `0x028000–0x02ffff` | `0x60028000–0x6002ffff` | 32 KiB | `0x09` (`9`) | `1, 0` | **User / Runtime KVS (`id=9`)** (`board+0x4510`, erased on `FactoryReset` `0x600749ea`) |
+| `0x030..0x033` | `0x030000–0x033fff` | `0x60030000–0x60033fff` | 16 KiB | `0x0b` (`11`) | `0, 0` | **Bluetooth bond NVRAM (`id=11`)** (`0x60065454`, erased on `FactoryReset` `0x60074a66`) |
+| `0x034..0x037` | `0x034000–0x037fff` | `0x60034000–0x60037fff` | 16 KiB | `0x11` (`17`) | `0, 0` | Auxiliary data partition (`id=17`, `board+0x6700`) |
+| `0x038..0x03b` | `0x038000–0x03bfff` | `0x60038000–0x6003bfff` | 16 KiB | `0x05` (`5`) | `1, 1` | **Factory / Persistent KVS (`id=5`)** (`board+0x5060`, survives `FactoryReset`: serial, `BruceMfgDate`, `DeviceColor`, calibration, `IsDfDevice`, `SsdpUdn`) |
+| `0x03c..0x03f` | `0x03c000–0x03ffff` | `0x6003c000–0x6003ffff` | 16 KiB | `0x04` (`4`) | `1, 1` | **Bootloader Metadata KVS (`id=4`)** (`board+0x5bb0`: `AppAMeta`, `AppBMeta`, `RecoveryMeta`, `BookkeepVer`, `BookkeepMeta`) |
+| `0x040..0x7ff` | `0x040000–0x7fffff` | `0x60040000–0x607fffff` | 7.75 MiB | `0x01` (`1`) | `0, 0` | Application Slot A (`bruce` / `gotham`, `board+0x4408`) |
+| `0x800..0x81f` | `0x800000–0x81ffff` | `0x60800000–0x6081ffff` | 128 KiB | `0x03` (`3`) | `0, 0` | Bootloader Slot A (`zatanna`, `board+0x43b0`) |
+| `0x820..0x83f` | `0x820000–0x83ffff` | `0x60820000–0x6083ffff` | 128 KiB | `0x13` (`19`) | `0, 0` | Bootloader Slot B (`board+0x43dc`; `id=4` in `zatanna`) |
+| `0x840..0xfff` | `0x840000–0xffffff` | `0x60840000–0x60ffffff` | 7.75 MiB | `0x02` (`2`) | `0, 0` | Application Slot B (`gotham`, `board+0x4434`) |
+
+Cross-check: `flash_lut.cc` init at `0x60067e44` configures two hardware layers
+over the exact writable window `0x60006000` + length `0x3a000`
+(`0x006000–0x03ffff`, sectors `0x006..0x03f`), leaving sectors `0x000..0x005`
+(`FCB`, `Boot IVT`, `id=7`, `id=10`) outside normal application writes:
+
+1. **i.MX RT106x BEE Region 1 bus encryption (`0x403EC000` BEE + `0x402FC000` DCP):**
+   `0x600717d4` → `0x60067e44` → `0x6005f07c` enables **BEE Region 1 (`AES-128-ECB`)**
+   across `[0x60006000, 0x60040000)` using key descriptor `0x601091f8`
+   (hardware OTP key slot selected via `HW_OCOTP_CFG5` `BEE_KEY1_SEL` =
+   `SW_GP2`/`OTPMK`). Because BEE decrypts AHB reads transparently in silicon
+   while NOR flash writes use `0x6005f310` (DCP `AES-128-ECB` encryption prior
+   to FlexSPI page programming), all writes inside `0x60006000–0x6003ffff`
+   enforce **16-byte alignment (`g = 16`, `0x6005f320..0x6005f326`)**.
+2. **Structural verification on captured `low_256k.bin` (PVT unit, 2026-11-15):**
+   reading raw NOR pins via FlexSPI IPCMD (`0x402A8100`) yields raw ciphertext
+   with clean `0xFF` tails strictly ending on 16-byte block boundaries (`% 16 == 15`),
+   matching `g = 16` (`Mount` `0x600cb6fc` formats standby sectors by writing
+   Chunk 0 `+0x00..+0x0f`, leaving `Chunk 1` `+0x10..+0x1f` erased until sealed,
+   and appending records from `+0x20`):
+   - `user_kvs` (`id=9`, `0x028000–0x02ffff`, 8 sectors): `sec[1]` active
+     (`active_no_seq`, `23` record blocks = `368 B`, `erased_tail = 3696 B`) +
+     `7` `standby_formatted` sectors (`1` header block each, `erased_tail = 4080 B`).
+   - `factory_kvs` (`id=5`, `0x038000–0x03bfff`, 4 sectors): `sec[1]` (`active_no_seq`,
+     `159` record blocks, `erased_tail = 1520 B`), `sec[2]` (`active_no_seq`, `107`
+     record blocks, `erased_tail = 2352 B`), plus `sec[0]` & `sec[3]` `standby_formatted`.
+   - `bootloader_kvs` (`id=4`, `0x03c000–0x03ffff`, 4 sectors): `sec[1]`
+     `active_sequenced` (`Chunk 0` + `Chunk 1` sequence + `252` record blocks,
+     `erased_tail = 32 B`), `sec[2]` `active_no_seq` (`136` record blocks,
+     `erased_tail = 1888 B`), plus `sec[0]` & `sec[3]` `standby_formatted` —
+     matching the live `BookkeepMeta: active=1, backup=2` state reported by the
+     controller over USB Bulk `transfer_bug_report` (`op=9`).
+   - `bug_reports` (`id=8`: `32` × 16 B blocks), `bt_nvram` (`id=11`: `128` ×
+     16 B blocks), and `aux_data_17` (`id=17`: `210` × 16 B blocks) also hold
+     high-entropy 16-byte ciphertext blocks ending cleanly on 16-byte boundaries.
+
+### 3.2 Parser CLI invocation
+
+For a surgical low-256 KiB capture (`low_256k.bin` starting at `0x60000000`),
+inspect and carve all partitions offline (with automatic redaction of sensitive
+serials/UDNs by default) using `tools/nor_slice_inspect.py`:
+
+```bash
+python3 tools/nor_slice_inspect.py low_256k.bin --base-offset 0x60000000 \
+  --extract-dir ./carved_local --json low_256k_report.json
+```
+
+Or invoke `tools/kvs_parse.py` directly against the exact carved KVS regions
+(or the whole `low_256k.bin@0x60000000` / `full.bin@0x60000000`):
 
 ```bash
 python3 tools/kvs_parse.py \
-  --region kvs.bin@0x60940000 \
+  --region ./carved_local/user_kvs.bin@0x60028000 \
+  --region ./carved_local/factory_kvs.bin@0x60038000 \
+  --region ./carved_local/bootloader_kvs.bin@0x6003c000 \
   --json kvs_result.json
 ```
 
-(Earlier triage drafts used `--region gap1.bin@0x60002000 --region gap2.bin@0x60424000 --region tail.bin@0x60C24000`, which reflected pre-`README.md` §1 slice names; a single full-NOR dump is `--region full.bin@0x60000000`.) CLI defaults to `--sector-align 0x1000` (4 KB NOR erase sectors) so embedded `0xABCD` bytes inside record payloads cannot trigger false sector splits; pass `--sector-align 0` only for synthetic/unaligned sub-slices. Output: full record listing (offset, sector sequence, key, flags, LIVE/DEAD, CRC status, value as hex + u32 + ASCII), sector table (with TORN-TAIL flags), the verdict block (§4, emitting `CRC_BAD` if the winner failed CRC), any equal-sequence cross-sector `ambiguities`, and the JSON file with the same fields.
+CLI defaults to `--sector-align 0x1000` (4 KB NOR erase sectors) so embedded `0xABCD` bytes inside record payloads cannot trigger false sector splits; pass `--sector-align 0` only for synthetic/unaligned sub-slices. For BEE-encrypted raw dumps in `0x60006000..0x6003ffff`, `kvs_parse.py` reports `bee_encrypted: true` (`align: 16`) and lists per-sector `bee_sectors` state (`standby_formatted`, `active_no_seq`, `active_sequenced`) and 16-byte block counts. For plaintext KVS regions, output includes the full record listing (offset, sector sequence, key, flags, LIVE/DEAD, CRC status, value as hex + u32 + ASCII), sector table (with TORN-TAIL flags), the verdict block (§4, emitting `CRC_BAD` if the winner failed CRC), and any equal-sequence cross-sector `ambiguities`.
 
-Self-test (no hardware): `python3 tools/kvs_parse.py --selftest` builds synthetic sectors (an aborted dead write superseded by live records, a newer sector winning over an older one, an empty-value `SsdpUdn`, a tombstone-only key, a torn sector tail, an erased sector, a bad-CRC winning record, an embedded `0xABCD` false-positive test over the CLI `main()` path, and sequence-collision ambiguity surfacing) and asserts the verdicts. Negative control: run against the gotham app image itself, the parser finds 0 sectors and reports all keys ABSENT.
+Self-test (no hardware): `python3 tools/kvs_parse.py --selftest` builds synthetic sectors (including `g=4` and `g=16`/`version=4` headers with `records_offset=0x20`, erased `Chunk 1` sequence handling, an aborted dead write superseded by live records, an empty-value `SsdpUdn`, a tombstone-only key, a torn sector tail, a bad-CRC winning record, an embedded `0xABCD` guard, sequence-collision ambiguity surfacing, and BEE AES-128-ECB sector classification) and asserts all verdicts. `python3 tools/nor_slice_inspect.py --self-test` tests partitioning across all 10 regions in the low 256 KiB slice (`FCB` + 9 partitions), BEE-encrypted KVS reporting, partial Slot B header decoding, and redaction. Negative control: run `kvs_parse.py` against a plaintext firmware app image, the parser finds 0 sectors and reports all keys ABSENT.
 
 ## 4. Decision table
 
@@ -159,22 +244,32 @@ absent.** A dump landing in a ★ cell closes the property question by the
 physical route; the IsDfDevice column then only decides whether the unit
 was *also* factory-provisioned.
 
-**Bruce transfer & resolved dual-path reconciliation (2026-11-13; fuse backing updated 2026-11-15):** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The earlier echo-token observation (`triage Part 1`: `key_index = 3`, `A OR B` gate, echo memcmp against `SsdpUdn`, "successful empty-token unlock") and the later ECDSA trace in `README.md` §7.1.1 are **both real — they are the two branches of the same unlock handler** (disasm `0x60077d92`): the `(OCOTP fuse 0x26 bit 8 OR IsDfDevice)` gate selects an echo-memcmp path (challenge `strlen`+`memcmp`; a SsdpUdn-less unit yields an empty challenge, hence the empty-token success), and only when that gate fails does kind 2 fall through to ECDSA P-256 verification against Google's embedded PEM keys. Full path detail in `README.md` §7.1.1; §9 item 6 closed. Additionally, whether bruce's challenge string is seeded from its KVS `SsdpUdn` record was not traced and remains open (§4 evidence: the challenge buffer is populated from OCRAM `0x2000d1d5`, whose provenance — KVS seed vs runtime generation — is unconfirmed).
+**Bruce transfer & resolved dual-path reconciliation (2026-11-13; fuse backing & live verification updated 2026-11-15):** format, CRC, and winner semantics are verified identical in bruce (§1, §2 — FACT). The earlier echo-token observation (`triage Part 1`: `key_index = 3`, `A OR B` gate, echo memcmp against `SsdpUdn`, "successful empty-token unlock") and the later ECDSA trace in `README.md` §7.1.1 are **both real — they are the two branches of the same unlock handler** (disasm `0x60077d92`): the `(OCOTP fuse 0x26 bit 8 OR IsDfDevice)` gate selects an echo-memcmp path (challenge `strlen`+`memcmp`; a SsdpUdn-less unit yields an empty challenge, hence the empty-token success), and only when that gate fails does kind 2 fall through to ECDSA P-256 verification against Google's embedded PEM keys. Full path detail in `README.md` §7.1.1; §9 item 6 closed. Live hardware probing on a `ReadyForEndUserUse` `bruce 337784` unit (`18d1:9400`) confirmed that `0x2000d1d5` holds the 36-char `SsdpUdn` UUID (returned by both `EP0 IN 0x87` and `UnlockChallengeResponse.field_1`) and `0x2000d168` holds the 14-char `DevSerial` (`UnlockChallengeResponse.field_2`), with `UnlockChallenge` (`08 01 18 01`) succeeding pre-unlock (`required_mask = 0`) and returning `key_index = 2`; raw FlexSPI NOR dumps confirmed that `id=9` and `id=5` sit inside the hardware-encrypted BEE Region 1 window (§3.1, `AES-128-ECB`, `g = 16`).
 
 ## 5. What remains open
 
 - ~~Reconcile `key_index = 3` / `A OR B` echo-unlock notes (§4) with the `ECDSA P-256` gate documented in `README.md` §7.1.1.~~ **Resolved 2026-11-13; fuse backing closed 2026-11-15 (issue #3):** dual-path unlock confirmed in disassembly — echo-memcmp behind the `(OCOTP fuse 0x26 bit 8 via FUN_00001084 @ 0x401F4000 OR IsDfDevice)` gate (with no `bruce` writer for KVS key `0x16`), and ECDSA P-256 as the fallback for end-user units.
-- The CRC is fully reversed and validated against the firmware's own tables
-  (§2); it is **not** yet validated against a genuine on-flash record,
-  because no KVS dump exists yet. First real dump = first end-to-end test.
-- Alignment granularity: auto-detected by the parser (CRC-scored), not
-  statically fixed. If a real dump produces no CRC-valid records under any
-  candidate alignment, the format assumptions in §1 must be revisited
-  before any verdict is drawn.
-- Sector header bytes +4..+7 and record flags bits 1..15: uninterpreted
-  (reported raw). Neither affects the verdict keys (IsDfDevice, SsdpUdn,
-  UpdateGauge).
-- The concrete NOR offsets of the KVS partitions (gotham ids 9 and 5)
-  remain statically undetermined (triage open item 1); the parser does not
-  need them - it finds sectors by header scan anywhere in the dumped
-  regions.
+- **Plaintext on-flash record CRC verification vs BEE ciphertext (§1–§3.1):**
+  the CRC-16/CCITT-FALSE algorithm is proven against both firmware tables
+  and test vectors (§2), and the hardware dump of `0x006000..0x03ffff`
+  proved why FlexSPI IPCMD captures of `id=9`, `id=5`, and `id=4` yield
+  16-byte-aligned `AES-128-ECB` ciphertext (`g = 16` under BEE Region 1)
+  rather than plaintext `0xABCD`/`0x55AA` headers. End-to-end offline CRC-16
+  parsing of genuine KVS records therefore requires a CPU-bus (AHB-decrypted)
+  dump or an unencrypted development unit.
+- ~~Alignment granularity (`this+0x59`) and sector header bytes `+0x04..+0x07`~~
+  **Resolved (2026-11-15):** disassembly of `Mount` (`0x600cb89c` in `bruce`)
+  and `flash_lut.cc` (`0x6005f320`) confirms `sector+0x04` (`u16`) stores the
+  granularity `g` for `version in (3, 4)` (`version == 2` forces `g = 1`),
+  `sequence` (`Chunk 1`) sits at `+align_up(g, 8)` (`0xFF` = unsealed
+  `0xFFFFFFFFFFFFFFFF`), and records start at `+2 * align_up(g, 8)` (`+0x20`
+  when `g = 16` under BEE). Header `+0x06..+0x07` and record `flags` bits
+  1..15 remain reserved/reported raw.
+- ~~The concrete NOR offsets of the KVS partitions (gotham ids 9 and 5)
+  remain statically undetermined (triage open item 1)~~ **Resolved (2026-11-15):**
+  disassembly of `board+0x4378` (`bruce 337784` `0x600740e2..0x60074580`,
+  `gotham 316382` `0x608af764..0x608afade`) places all three KVS instances inside
+  the first 256 KiB of NOR (§3.1): `id=9` User KVS at `0x028000–0x02ffff`
+  (`0x60028000`, 32 KiB), `id=5` Factory/Persistent KVS at `0x038000–0x03bfff`
+  (`0x60038000`, 16 KiB), and `id=4` Bootloader Metadata KVS at `0x03c000–0x03ffff`
+  (`0x6003c000`, 16 KiB).

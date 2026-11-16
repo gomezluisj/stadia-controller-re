@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """kvs_parse.py - parser for the Stadia controller key_value_store (KVS) NOR dumps.
 
-Format (reversed from gotham 235551, verified line-equivalent in bruce 337784;
-see kvs-parser-spec.md for code addresses):
+Format (reversed from gotham 235551/282115 and bruce 337784, and verified on
+captured hardware NOR slices; see kvs-parser-spec.md for code addresses):
 
-  Sector header (16 B):
-    +0x00 u16 magic 0xABCD | +0x02 u16 version (2..4) | +0x04..0x07 metadata
-    +0x08 u64 sequence (LE) -- generation counter, higher = newer sector
-    records start at sector + 16
+  Sector header (2 * align(8) bytes: 16 B when g <= 8; 32 B when g == 16):
+    Chunk 0 (+0x00 .. +align(8)-1):
+      +0x00 u16 magic 0xABCD | +0x02 u16 version (2..4)
+      +0x04 u16 granularity g (verified in bruce Mount 0x600cb89c; 0 or ignored in v2 -> g=1)
+      +0x06 u16 reserved/metadata
+    Chunk 1 (+align(8) .. +2*align(8)-1):
+      +align(8) u64 sequence (LE) -- generation counter, higher = newer sector
+      (or all 0xFF while sector is unsealed; Mount assigns 0xFFFFFFFFFFFFFFFF)
+    records start at sector + 2 * align(8) (+0x10 for g<=8, +0x20 for g=16)
 
   Record header (8 B):
     +0x00 u16 magic 0x55AA | +0x02 u16 CRC-16/CCITT-FALSE over key||value
@@ -16,13 +21,21 @@ see kvs-parser-spec.md for code addresses):
     key   at record + align(8)
     value at record + align(8) + align(key_len)
     total = align(8) + align(key_len) + align(value_len)
-    align() rounds up to the store granularity (runtime byte, statically
-    unknown; the parser auto-detects it among {4,1,2,8} scored by CRC hits)
+    align() rounds up to store granularity g in {1, 2, 4, 8, 16} (g=16 on
+    BEE-encrypted NOR partitions in 0x60006000..0x6003ffff).
 
-  Winner resolution (mount semantics, FUN_6020415E): per key, the record in
-  the sector with the highest sequence wins; ties within a sector go to the
-  highest offset. If the winning record is a tombstone (flags bit 0 = 1) the
-  key reads as ABSENT in the firmware.
+  Hardware encryption note (BEE Region 1):
+    Firmware configures i.MX RT106x BEE Region 1 (AES-128-ECB) across
+    0x60006000..0x6003ffff (sectors 0x006..0x03f, covering id=9 user_kvs,
+    id=5 factory_kvs, and id=4 bootloader_kvs) with g = 16. Direct FlexSPI NOR
+    reads observe ciphertext blocks (no plaintext 0xABCD/0x55AA); detect_bee_sectors()
+    classifies 4 KiB sector occupancy structurally into standby_formatted,
+    active_no_seq, and active_sequenced states.
+
+  Winner resolution (mount semantics, FUN_6020415E / 0x600cb6fc): per key, the
+  record in the sector with the highest sequence wins; ties within a sector go
+  to the highest offset. If the winning record is a tombstone (flags bit 0 = 1)
+  the key reads as ABSENT in the firmware.
 
 Usage:
   python3 kvs_parse.py --region gap1.bin@0x60002000 \
@@ -34,19 +47,54 @@ pass --sector-align 0 for unaligned synthetic blobs).
 """
 
 import argparse
+import collections
 import contextlib
+from dataclasses import asdict, dataclass, field
+import hashlib
 import io
 import json
+import math
 import os
 import struct
 import sys
 import tempfile
+from typing import Any, Dict, List
 
 SECTOR_MAGIC = 0xABCD
 RECORD_MAGIC = 0x55AA
 SECTOR_VERSIONS = (2, 3, 4)
-ALIGN_CANDIDATES = (4, 1, 2, 8)
+ALIGN_CANDIDATES = (4, 1, 2, 8, 16)
+BEE_REGION1_PHYS_START = 0x006000
+BEE_REGION1_PHYS_END = 0x040000
+BEE_REGION1_XIP_START = 0x60006000
+BEE_REGION1_XIP_END = 0x60040000
 KEYS_OF_INTEREST = ("IsDfDevice", "SsdpUdn", "UpdateGauge")
+
+
+@dataclass
+class BeeEncryptedSector:
+    """Structural summary of a 4 KiB NOR sector encrypted with BEE AES-128-ECB (g=16)."""
+
+    region: str
+    sector_index: int
+    offset: int
+    state: str
+    encrypted_blocks_16b: int
+    record_blocks_16b: int
+    erased_tail_bytes: int
+
+
+@dataclass
+class KvsImage:
+    """Parsed KVS dump summary across one or more NOR regions."""
+
+    align: int
+    sectors: List[Dict[str, Any]]
+    records: List[Dict[str, Any]]
+    winners: Dict[str, Dict[str, Any]]
+    verdicts: Dict[str, Dict[str, Any]]
+    ambiguities: List[Dict[str, Any]] = field(default_factory=list)
+    bee_sectors: List[BeeEncryptedSector] = field(default_factory=list)
 
 # ---------------------------------------------------------------- CRC ------
 # CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, refin/out False, xorout 0.
@@ -99,6 +147,54 @@ class Region:
 
 # ---------------------------------------------------------- sector scan ----
 
+def _shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = collections.Counter(data)
+    n = len(data)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _in_bee_window(addr: int) -> bool:
+    return (
+        BEE_REGION1_PHYS_START <= addr < BEE_REGION1_PHYS_END
+        or BEE_REGION1_XIP_START <= addr < BEE_REGION1_XIP_END
+    )
+
+
+def _detect_sector_header(data: bytes, offset: int = 0):
+    """Parse KVS sector header at offset. Returns metadata dict or None."""
+    if offset < 0 or offset + 16 > len(data):
+        return None
+    magic, version, raw_granularity = struct.unpack_from("<HHH", data, offset)
+    if magic != SECTOR_MAGIC or version not in SECTOR_VERSIONS:
+        return None
+    if version == 2:
+        granularity = 1
+        hdr_chunk = 8
+    elif raw_granularity in ALIGN_CANDIDATES:
+        granularity = raw_granularity
+        hdr_chunk = align_up(granularity, 8)
+    else:
+        granularity = None
+        hdr_chunk = 8
+    records_offset = 2 * hdr_chunk
+    if offset + records_offset > len(data):
+        return None
+    seq = u64(data, offset + hdr_chunk)
+    seq_erased = data[offset + hdr_chunk : offset + records_offset] == (b"\xff" * hdr_chunk)
+    return {
+        "version": version,
+        "raw_granularity": raw_granularity,
+        "granularity": granularity,
+        "hdr_chunk": hdr_chunk,
+        "records_offset": records_offset,
+        "seq": seq,
+        "seq_erased": seq_erased,
+        "meta_4_7": data[offset + 4 : offset + 8].hex(),
+    }
+
+
 def find_sector_candidates(region, sector_align=None):
     """Offsets (region-relative) of plausible sector headers: magic +
     version in range, and the record area either starts with a record magic
@@ -118,26 +214,23 @@ def find_sector_candidates(region, sector_align=None):
         start = i + 1
         if sector_align and (i % sector_align) != 0:
             continue
-        if i + 16 > len(data):
+        hdr = _detect_sector_header(data, i)
+        if hdr is None:
             continue
-        ver = u16(data, i + 2)
-        if ver not in SECTOR_VERSIONS:
-            continue
-        probe = data[i + 16:i + 16 + 64]
+        rec_off = hdr["records_offset"]
+        probe = data[i + rec_off : i + rec_off + 64]
         if len(probe) >= 2 and probe[:2] == b"\xaa\x55":
             out.append(i)
         elif probe and (set(probe) == {0xFF} or set(probe) == {0x00}):
             out.append(i)
     return out
 
-def walk_sector(region, sec_off, span_end, g):
-    """Walk records of one sector. Returns (records, end_pos, torn) where
-    end_pos is the region-relative offset just past the last good record and
-    torn=True when the walk stopped on a bad/truncated header (vs. erased
-    tail or span end)."""
+
+def _try_parse_records_at(region, sec_off, span_end, g, records_offset=16, has_tombstone_slot=False):
+    """Walk KVS records starting at sec_off + records_offset using granularity g."""
     data = region.data
     records = []
-    pos = sec_off + 16
+    pos = sec_off + records_offset
     torn = False
     while True:
         if pos + 8 > span_end:
@@ -160,11 +253,19 @@ def walk_sector(region, sec_off, span_end, g):
         key_off = pos + align_up(g, 8)
         val_off = key_off + align_up(g, klen)
         total = align_up(g, 8) + align_up(g, klen) + align_up(g, vlen)
+        if has_tombstone_slot:
+            tomb_off = pos + total
+            total += align_up(g, 2)
+        else:
+            tomb_off = None
         if pos + total > span_end or val_off + vlen > span_end:
             torn = True
             break
         key = bytes(data[key_off:key_off + klen])
         val = bytes(data[val_off:val_off + vlen])
+        live = (flags & 1) == 0
+        if tomb_off is not None and u16(data, tomb_off) != 0xFFFF:
+            live = False
         records.append({
             "offset": region.base + pos,
             "region": region.name,
@@ -172,12 +273,25 @@ def walk_sector(region, sec_off, span_end, g):
             "key_bytes": key,
             "value": val,
             "flags": flags,
-            "live": (flags & 1) == 0,
+            "live": live,
             "crc_stored": crc_stored,
             "crc_computed": record_crc(key, val),
         })
         pos += total
     return records, pos, torn
+
+
+def walk_sector(region, sec_off, span_end, g, records_offset=16, has_tombstone_slot=False):
+    """Walk records of one sector. Returns (records, end_pos, torn) where
+    end_pos is the region-relative offset just past the last good record and
+    torn=True when the walk stopped on a bad/truncated header (vs. erased
+    tail or span end)."""
+    return _try_parse_records_at(
+        region, sec_off, span_end, g,
+        records_offset=records_offset,
+        has_tombstone_slot=has_tombstone_slot,
+    )
+
 
 def parse_regions(regions, align_override=None, sector_align=None):
     """Returns (sectors, records, align_used). Sector spans run to the next
@@ -189,33 +303,130 @@ def parse_regions(regions, align_override=None, sector_align=None):
     aligns = [align_override] if align_override else list(ALIGN_CANDIDATES)
     best = None
     for g in aligns:
-        sectors, records = [], []
-        for region in regions:
-            cands = find_sector_candidates(region, sector_align)
-            accepted_end = -1
-            for idx, soff in enumerate(cands):
-                if soff < accepted_end:
-                    continue  # inside the walked extent of a previous sector
-                span_end = cands[idx + 1] if idx + 1 < len(cands) else len(region.data)
-                recs, end_pos, torn = walk_sector(region, soff, span_end, g)
-                sectors.append({
-                    "region": region.name,
-                    "offset": region.base + soff,
-                    "version": u16(region.data, soff + 2),
-                    "meta_4_7": region.data[soff + 4:soff + 8].hex(),
-                    "seq": u64(region.data, soff + 8),
-                    "torn": torn,
-                    "n_records": len(recs),
-                })
-                records.extend(recs)
-                accepted_end = end_pos
-        crc_ok = sum(1 for r in records if r["crc_stored"] == r["crc_computed"])
-        clean = sum(1 for s in sectors if not s["torn"])
-        score = (crc_ok, clean, len(records))
-        if best is None or score > best[0]:
-            best = (score, sectors, records, g)
+        for has_tombstone_slot in (False, True):
+            sectors, records = [], []
+            gran_matches = 0
+            for region in regions:
+                cands = find_sector_candidates(region, sector_align)
+                accepted_end = -1
+                for idx, soff in enumerate(cands):
+                    if soff < accepted_end:
+                        continue  # inside the walked extent of a previous sector
+                    hdr = _detect_sector_header(region.data, soff)
+                    if hdr is None:
+                        continue
+                    span_end = cands[idx + 1] if idx + 1 < len(cands) else len(region.data)
+                    recs, end_pos, torn = walk_sector(
+                        region, soff, span_end, g,
+                        records_offset=hdr["records_offset"],
+                        has_tombstone_slot=has_tombstone_slot,
+                    )
+                    if hdr["granularity"] == g:
+                        gran_matches += 1
+                    sectors.append({
+                        "region": region.name,
+                        "offset": region.base + soff,
+                        "version": hdr["version"],
+                        "granularity": hdr["granularity"],
+                        "records_offset": hdr["records_offset"],
+                        "meta_4_7": hdr["meta_4_7"],
+                        "seq": hdr["seq"],
+                        "seq_erased": hdr["seq_erased"],
+                        "torn": torn,
+                        "n_records": len(recs),
+                    })
+                    records.extend(recs)
+                    accepted_end = end_pos
+            crc_ok = sum(1 for r in records if r["crc_stored"] == r["crc_computed"])
+            clean = sum(1 for s in sectors if not s["torn"])
+            # Prefer 3-chunk layout (no trailing tombstone) on exact ties
+            score = (crc_ok, clean, len(records), gran_matches, 1 if not has_tombstone_slot else 0)
+            if best is None or score > best[0]:
+                best = (score, sectors, records, g)
     _, sectors, records, g = best
     return sectors, records, g
+
+
+def detect_bee_sectors(regions, plain_sectors) -> List[BeeEncryptedSector]:
+    """Classify 4 KiB sectors matching BEE AES-128-ECB (g=16) block geometry.
+
+    When raw NOR flash inside 0x60006000..0x6003ffff is read via FlexSPI IPCMD
+    (bypassing AHB bus decryption), plaintext 0xABCD/0x55AA markers are masked
+    by AES-128-ECB, but 16-byte write blocks and trailing 0xFF erased regions
+    remain structurally visible:
+      - standby_formatted: only Chunk 0 (+0x00..+0x0f) populated, +0x10..+0xfff erased (0xFF)
+      - active_no_seq:     Chunk 0 populated, Chunk 1 (+0x10..+0x1f) 0xFF, N>=1 record blocks
+      - active_sequenced:  Chunk 0 and Chunk 1 populated, N>=1 record blocks
+    """
+    plain_offsets = {(s["region"], s["offset"]) for s in plain_sectors}
+    out: List[BeeEncryptedSector] = []
+    for region in regions:
+        data = region.data
+        n_sectors = len(data) // 0x1000
+        for s_idx in range(n_sectors):
+            sec_off = s_idx * 0x1000
+            abs_off = region.base + sec_off
+            if (region.name, abs_off) in plain_offsets:
+                continue
+            sec = data[sec_off : sec_off + 0x1000]
+            if sec == b"\xff" * 0x1000 or sec == b"\x00" * 0x1000:
+                continue
+            # Reject unencrypted FCB / HABv4 IVT plaintext blocks
+            if sec.startswith(b"FCFB") or (sec[0] == 0xD1 and sec[3] in (0x40, 0x41)):
+                continue
+            blk0 = sec[0:16]
+            if blk0 == b"\xff" * 16 or blk0 == b"\x00" * 16 or len(set(blk0)) < 10:
+                continue
+
+            erased_tail = 0
+            for off in range(0x1000 - 16, -1, -16):
+                if sec[off : off + 16] == b"\xff" * 16:
+                    erased_tail += 16
+                else:
+                    break
+            active_len = 0x1000 - erased_tail
+            if erased_tail < 16 and not _in_bee_window(abs_off):
+                continue
+            if any(sec[o : o + 16] == b"\x00" * 16 for o in range(0, active_len, 16)):
+                continue
+
+            if active_len == 16 and sec[16:] == b"\xff" * (0x1000 - 16):
+                out.append(BeeEncryptedSector(
+                    region=region.name,
+                    sector_index=s_idx,
+                    offset=abs_off,
+                    state="standby_formatted",
+                    encrypted_blocks_16b=1,
+                    record_blocks_16b=0,
+                    erased_tail_bytes=erased_tail,
+                ))
+                continue
+
+            if active_len < 48:
+                continue
+            blk1 = sec[16:32]
+            blk1_erased = (blk1 == b"\xff" * 16)
+            if any(sec[o : o + 16] == b"\xff" * 16 for o in range(32, active_len, 16)):
+                continue
+            pop_bytes = blk0 + (b"" if blk1_erased else blk1) + sec[32:active_len]
+            if len(pop_bytes) >= 128:
+                if _shannon_entropy(pop_bytes) < 6.2:
+                    continue
+            elif len(set(pop_bytes)) < min((len(pop_bytes) * 5) // 8, 44):
+                continue
+
+            rec_blocks = (active_len - 32) // 16
+            hdr_blocks = 1 if blk1_erased else 2
+            out.append(BeeEncryptedSector(
+                region=region.name,
+                sector_index=s_idx,
+                offset=abs_off,
+                state="active_no_seq" if blk1_erased else "active_sequenced",
+                encrypted_blocks_16b=hdr_blocks + rec_blocks,
+                record_blocks_16b=rec_blocks,
+                erased_tail_bytes=erased_tail,
+            ))
+    return out
 
 # ------------------------------------------------------------ resolving ----
 
@@ -327,14 +538,22 @@ def fmt_value(val):
         parts.append("ascii=%r" % val.decode("ascii"))
     return " ".join(parts)
 
-def render_text(regions, sectors, records, g, verd, ambiguities=()):
+def render_text(regions, sectors, records, g, verd, ambiguities=(), bee_sectors=()):
     lines = []
-    lines.append("KVS parse: %d region(s), %d sector(s), %d record(s), align=%d"
-                 % (len(regions), len(sectors), len(records), g))
+    align_disp = "%d (BEE AES-128-ECB inferred)" % 16 if (bee_sectors and not sectors) else "%d" % g
+    lines.append("KVS parse: %d region(s), %d sector(s), %d record(s), align=%s"
+                 % (len(regions), len(sectors), len(records), align_disp))
+    if bee_sectors:
+        lines.append("  BEE Region 1 encrypted sectors detected (AES-128-ECB, g=16): %d"
+                     % len(bee_sectors))
     for s in sectors:
         lines.append("  sector @0x%08X (%s) version=%d seq=%d records=%d%s"
                      % (s["offset"], s["region"], s["version"], s["seq"],
                         s["n_records"], " TORN-TAIL" if s["torn"] else ""))
+    for bs in bee_sectors:
+        lines.append("  bee-sector #%d @0x%08X (%s) state=%s blocks_16b=%d record_blocks_16b=%d erased_tail=%d"
+                     % (bs.sector_index, bs.offset, bs.region, bs.state,
+                        bs.encrypted_blocks_16b, bs.record_blocks_16b, bs.erased_tail_bytes))
     lines.append("")
     lines.append("--- records (offset order) ---")
     for r in sorted(records, key=lambda r: r["offset"]):
@@ -352,6 +571,10 @@ def render_text(regions, sectors, records, g, verd, ambiguities=()):
                         fmt_value(r["value"])))
     lines.append("")
     lines.append("--- verdicts ---")
+    if bee_sectors and not sectors:
+        lines.append("NOTE: raw NOR dump contains BEE Region 1 AES-128-ECB ciphertext "
+                     "(read via FlexSPI IPCMD outside AHB decryption); keys cannot be "
+                     "decoded offline without the device OTP key.")
     for k in KEYS_OF_INTEREST:
         lines.append("%s: %s" % (k, json.dumps(verd[k], sort_keys=True)))
     if ambiguities:
@@ -367,7 +590,7 @@ def render_text(regions, sectors, records, g, verd, ambiguities=()):
                      "firmware would reject them on full read)" % len(bad))
     return "\n".join(lines)
 
-def to_json(regions, sectors, records, g, verd, ambiguities=()):
+def to_json(regions, sectors, records, g, verd, ambiguities=(), bee_sectors=()):
     out_records = []
     for r in sorted(records, key=lambda r: r["offset"]):
         try:
@@ -388,13 +611,39 @@ def to_json(regions, sectors, records, g, verd, ambiguities=()):
             "crc_stored": r["crc_stored"], "crc_computed": r["crc_computed"],
             "crc_ok": r["crc_stored"] == r["crc_computed"],
         })
-    return {"align": g, "sectors": sectors, "records": out_records,
-            "verdicts": verd, "ambiguities": list(ambiguities)}
+    effective_align = 16 if (bee_sectors and not sectors) else g
+    return {
+        "align": effective_align,
+        "sectors": sectors,
+        "bee_encrypted": bool(bee_sectors and not sectors),
+        "bee_sectors": [asdict(bs) for bs in bee_sectors],
+        "records": out_records,
+        "verdicts": verd,
+        "ambiguities": list(ambiguities),
+    }
 
 def attach_seqs(sectors, records):
     seq_by_sector = {(s["region"], s["offset"]): s["seq"] for s in sectors}
     for r in records:
         r["_sector_seq"] = seq_by_sector.get((r["region"], r["sector_offset"]), 0)
+
+def parse_kvs_image(regions, align_override=None, sector_align=0x1000) -> KvsImage:
+    """Parse one or more NOR KVS regions into a unified KvsImage summary."""
+    sectors, records, g = parse_regions(regions, align_override, sector_align=sector_align)
+    attach_seqs(sectors, records)
+    winners, ambiguities = resolve_winners(records)
+    verd = verdicts(winners)
+    bee_sectors = detect_bee_sectors(regions, sectors)
+    effective_g = 16 if (bee_sectors and not sectors) else g
+    return KvsImage(
+        align=effective_g,
+        sectors=sectors,
+        records=records,
+        winners=winners,
+        verdicts=verd,
+        ambiguities=ambiguities,
+        bee_sectors=bee_sectors,
+    )
 
 # ------------------------------------------------------------- selftest ----
 
@@ -410,11 +659,30 @@ def build_record(key, value, live, g, corrupt_crc=False):
     rec += value + b"\x00" * (align_up(g, vlen) - vlen)
     return rec
 
-def build_sector(seq, version, recs, size, g, torn_tail=b""):
-    hdr = struct.pack("<HH", SECTOR_MAGIC, version) + b"\x00" * 4 + struct.pack("<Q", seq)
+def build_sector(seq, version, recs, size, g, torn_tail=b"", write_granularity=False, seq_erased=False):
+    if write_granularity:
+        hdr_chunk = align_up(g, 8)
+        c0 = struct.pack("<HHH", SECTOR_MAGIC, version, g).ljust(hdr_chunk, b"\x00")
+        c1 = (b"\xff" * hdr_chunk) if seq_erased else struct.pack("<Q", seq).ljust(hdr_chunk, b"\x00")
+        hdr = c0 + c1
+    else:
+        hdr = struct.pack("<HH", SECTOR_MAGIC, version) + b"\x00" * 4 + struct.pack("<Q", seq)
     body = hdr + b"".join(recs) + torn_tail
     assert len(body) <= size
     return body + b"\xff" * (size - len(body))
+
+def _pseudo_aes_block(seed_bytes):
+    return hashlib.sha256(seed_bytes).digest()[:16]
+
+def _build_synthetic_bee_sector(state, rec_blocks=0, seed_prefix=b"bee"):
+    buf = bytearray(b"\xff" * 0x1000)
+    buf[0:16] = _pseudo_aes_block(seed_prefix + b"-chunk0")
+    if state == "active_sequenced":
+        buf[16:32] = _pseudo_aes_block(seed_prefix + b"-chunk1")
+    for idx in range(rec_blocks):
+        off = 32 + idx * 16
+        buf[off : off + 16] = _pseudo_aes_block(seed_prefix + f"-rec-{idx}".encode())
+    return bytes(buf)
 
 def selftest():
     g = 4
@@ -531,14 +799,56 @@ def selftest():
     check("ambiguities included in text and JSON outputs",
           "--- ambiguities ---" in txt_amb and len(js_amb.get("ambiguities", [])) == 1)
 
+    # g=16, version=4 header layout (Chunk 0 @+0x00..+0x0f, Chunk 1 seq @+0x10..+0x1f, records @+0x20).
+    sec_g16_seq = build_sector(4, 4, [
+        build_record(b"IsDfDevice", u32v(0), live=True, g=16),
+        build_record(b"UpdateGauge", u32v(1), live=True, g=16),
+    ], 0x1000, 16, write_granularity=True)
+    sec_g16_unsealed = build_sector(0, 4, [
+        build_record(b"SsdpUdn", b"UUID-16B-ALIGNED", live=True, g=16),
+    ], 0x1000, 16, write_granularity=True, seq_erased=True)
+    reg_g16 = Region("selftest-g16", 0x6003C000, sec_g16_seq + sec_g16_unsealed)
+    s_16, r_16, used_16 = parse_regions([reg_g16], sector_align=0x1000)
+    attach_seqs(s_16, r_16)
+    w_16, _ = resolve_winners(r_16)
+    v_16 = verdicts(w_16)
+    check("g=16 version=4 auto-detected with records@+0x20 and CRC valid",
+          used_16 == 16 and len(s_16) == 2 and len(r_16) == 3
+          and s_16[0]["records_offset"] == 32
+          and s_16[1]["seq"] == 0xFFFFFFFFFFFFFFFF
+          and s_16[1]["seq_erased"] is True
+          and all(r["crc_stored"] == r["crc_computed"] for r in r_16)
+          and v_16["SsdpUdn"].get("value") == "UUID-16B-ALIGNED")
+
+    # BEE Region 1 structural classification (standby_formatted, active_sequenced, active_no_seq).
+    bee_blob = (
+        _build_synthetic_bee_sector("standby_formatted", rec_blocks=0, seed_prefix=b"s0")
+        + _build_synthetic_bee_sector("active_sequenced", rec_blocks=6, seed_prefix=b"s1")
+        + _build_synthetic_bee_sector("active_no_seq", rec_blocks=3, seed_prefix=b"s2")
+        + (b"\xff" * 0x1000)
+    )
+    bee_reg = Region("selftest-bee", 0x6003C000, bee_blob)
+    bee_img = parse_kvs_image([bee_reg], sector_align=0x1000)
+    bee_detected = bee_img.bee_sectors
+    check("BEE AES-128-ECB sector classification (standby_formatted, active_sequenced, active_no_seq)",
+          len(bee_img.sectors) == 0 and len(bee_img.records) == 0 and bee_img.align == 16
+          and len(bee_detected) == 3
+          and [x.state for x in bee_detected] == ["standby_formatted", "active_sequenced", "active_no_seq"]
+          and bee_detected[0].encrypted_blocks_16b == 1 and bee_detected[0].erased_tail_bytes == 4080
+          and bee_detected[1].encrypted_blocks_16b == 8 and bee_detected[1].record_blocks_16b == 6
+          and bee_detected[2].encrypted_blocks_16b == 4 and bee_detected[2].record_blocks_16b == 3)
+
     # CLI path enforces default 0x1000 sector_align to ignore embedded 0xABCD bytes.
     embedded_payload = u32v(1) + b"\xcd\xab\x02\x00\x00\x00\x00\x00" + b"\xff" * 64
     cli_sec = build_sector(1, 4, [build_record(b"IsDfDevice", embedded_payload, True, g)], 0x1000, g)
     with tempfile.TemporaryDirectory() as td:
         dump_path = os.path.join(td, "kvs.bin")
+        bee_path = os.path.join(td, "bee_kvs.bin")
         json_path = os.path.join(td, "out.json")
         with open(dump_path, "wb") as fh:
             fh.write(cli_sec)
+        with open(bee_path, "wb") as fh:
+            fh.write(bee_blob)
         with contextlib.redirect_stdout(io.StringIO()):
             rc_cli = main(["--region", "%s@0x60940000" % dump_path, "--json", json_path])
         with open(json_path, "r") as fh:
@@ -554,6 +864,15 @@ def selftest():
         check("CLI --sector-align 0 disables alignment guard",
               rc_raw == 0 and len(raw_out["sectors"]) == 2 and
               raw_out["sectors"][0]["torn"] is True)
+        bee_stdout = io.StringIO()
+        with contextlib.redirect_stdout(bee_stdout):
+            rc_bee = main(["--region", "%s@0x6003C000" % bee_path, "--json", json_path])
+        with open(json_path, "r") as fh:
+            bee_out = json.load(fh)
+        check("CLI reports BEE encrypted sectors in text and JSON",
+              rc_bee == 0 and bee_out["bee_encrypted"] is True
+              and bee_out["align"] == 16 and len(bee_out["bee_sectors"]) == 3
+              and "BEE Region 1 encrypted sectors detected" in bee_stdout.getvalue())
 
     print("SELFTEST " + ("PASS" if not fails else "FAIL: %s" % ", ".join(fails)))
     return 0 if not fails else 1
@@ -594,18 +913,22 @@ def main(argv=None):
             regions.append(Region(path, base, fh.read()))
 
     sector_align = args.sector_align or None
-    sectors, records, g = parse_regions(regions, args.align, sector_align=sector_align)
-    attach_seqs(sectors, records)
-    winners, ambiguities = resolve_winners(records)
-    verd = verdicts(winners)
+    img = parse_kvs_image(regions, args.align, sector_align=sector_align)
+    payload = to_json(
+        regions, img.sectors, img.records, img.align,
+        img.verdicts, img.ambiguities, img.bee_sectors,
+    )
 
     if args.json == "-":
-        print(json.dumps(to_json(regions, sectors, records, g, verd, ambiguities), indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
-    print(render_text(regions, sectors, records, g, verd, ambiguities))
+    print(render_text(
+        regions, img.sectors, img.records, img.align,
+        img.verdicts, img.ambiguities, img.bee_sectors,
+    ))
     if args.json:
         with open(args.json, "w") as fh:
-            json.dump(to_json(regions, sectors, records, g, verd, ambiguities), fh, indent=2)
+            json.dump(payload, fh, indent=2)
         print("JSON written to %s" % args.json)
     return 0
 

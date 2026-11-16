@@ -7,6 +7,7 @@ Avoids all state-changing requests (0x80 DisableCharging, 0x82 EnterShippingMode
 
 Supports:
   --poll-battery   Trigger UpdateGauge via bRequest 0x83 before reading 0x84
+  --redact         Mask USB serial suffix and SsdpUdn UUID for public sharing
   --json           Emit machine-readable JSON output
   --selftest       Run offline parser and classifier unit tests (no hardware/pyusb)
 """
@@ -27,9 +28,12 @@ BM_REQ_CLASS_IFACE_OUT = 0x21
 REQ_BUILD_INFO = 0x81
 REQ_UPDATE_GAUGE = 0x83
 REQ_BATTERY_SOC = 0x84
-REQ_SERIAL = 0x87
-REQ_MFG_DATE = 0x88
-REQ_DEVICE_COLOR = 0x89
+REQ_SSDP_UDN = 0x87
+REQ_SKU = 0x88
+REQ_MODEL_ID = 0x89
+REQ_SERIAL = REQ_SSDP_UDN  # legacy alias preserved for callers
+REQ_MFG_DATE = REQ_SKU
+REQ_DEVICE_COLOR = REQ_MODEL_ID
 REQ_PROV_STATE = 0x8A
 REQ_UNLOCK_STATUS = 0x8C
 
@@ -70,6 +74,22 @@ def decode_cstr(raw):
     if nul != -1:
         raw = raw[:nul]
     return raw.decode("ascii", errors="replace").strip()
+
+
+def redact_identifiers(serial, ssdp_udn):
+    """Mask device-unique suffix of serial and SsdpUdn UUID for safe sharing."""
+    if serial:
+        masked_serial = (serial[:-4] + "XXXX") if len(serial) > 4 else ("X" * len(serial))
+    else:
+        masked_serial = ""
+    if ssdp_udn and "-" in ssdp_udn:
+        parts = ssdp_udn.split("-")
+        masked_udn = "-".join([parts[0]] + ["X" * len(p) for p in parts[1:]])
+    elif ssdp_udn:
+        masked_udn = (ssdp_udn[:4] + "X" * (len(ssdp_udn) - 4)) if len(ssdp_udn) > 4 else ("X" * len(ssdp_udn))
+    else:
+        masked_udn = ""
+    return masked_serial, masked_udn
 
 
 def decode_build_info_reply(raw):
@@ -133,7 +153,7 @@ def _find_vendor_interface(dev):
     return 2
 
 
-def query_controller(poll_battery=False):
+def query_controller(poll_battery=False, redact=False):
     """Query all read-only EP0 class/vendor diagnostic fields from a connected unit."""
     try:
         import usb.core  # type: ignore
@@ -146,6 +166,12 @@ def query_controller(poll_battery=False):
     dev = usb.core.find(idVendor=STADIA_VID, idProduct=STADIA_PID)
     if dev is None:
         raise RuntimeError(f"No Stadia Controller ({STADIA_VID:04x}:{STADIA_PID:04x}) found on USB.")
+
+    try:
+        usb_serial = (dev.serial_number or "").strip()
+    except Exception:
+        usb_serial = ""
+    hardware_stage = classify_hardware_stage(usb_serial)
 
     iface = _find_vendor_interface(dev)
     detached = False
@@ -163,9 +189,9 @@ def query_controller(poll_battery=False):
             return bytes(dev.ctrl_transfer(BM_REQ_CLASS_IFACE_IN, req, 0, iface, length, timeout=1500))
 
         build_info = decode_build_info_reply(ctrl_in(REQ_BUILD_INFO, 8))
-        serial = decode_cstr(ctrl_in(REQ_SERIAL, 64))
-        mfg_date = decode_cstr(ctrl_in(REQ_MFG_DATE, 64))
-        device_color = decode_cstr(ctrl_in(REQ_DEVICE_COLOR, 64))
+        ssdp_udn = decode_cstr(ctrl_in(REQ_SSDP_UDN, 64))
+        sku = decode_cstr(ctrl_in(REQ_SKU, 64))
+        model_id = decode_cstr(ctrl_in(REQ_MODEL_ID, 64))
         prov = decode_provisioning_reply(ctrl_in(REQ_PROV_STATE, 64))
         unlock = decode_unlock_reply(ctrl_in(REQ_UNLOCK_STATUS, 8))
 
@@ -174,16 +200,20 @@ def query_controller(poll_battery=False):
             time.sleep(0.5)
         battery_soc = decode_battery_reply(ctrl_in(REQ_BATTERY_SOC, 8))
 
+        if redact:
+            usb_serial, ssdp_udn = redact_identifiers(usb_serial, ssdp_udn)
+
         return {
             "usb_id": f"{STADIA_VID:04x}:{STADIA_PID:04x}",
             "interface": iface,
-            "serial": serial,
-            "hardware_stage": classify_hardware_stage(serial),
+            "serial": usb_serial,
+            "hardware_stage": hardware_stage,
+            "ssdp_udn": ssdp_udn,
+            "sku": sku,
+            "model_id": model_id,
             "build_number": build_info["build_number"],
             "board_rev": build_info["board_rev"],
             "firmware_family": build_info["firmware_family"],
-            "mfg_date": mfg_date,
-            "device_color": device_color,
             "provisioning_state": prov["state_name"],
             "provisioning_code": prov["state_code"],
             "battery_soc_percent": battery_soc,
@@ -191,6 +221,7 @@ def query_controller(poll_battery=False):
             "vendor_usb_task_active": unlock["vendor_usb_task_active"],
             "unlock_level": f"0x{unlock['unlock_level']:08x}",
             "unlocked": unlock["unlocked"],
+            "redacted": redact,
         }
     finally:
         try:
@@ -219,13 +250,17 @@ def run_selftest():
     assert classify_hardware_stage("98091234") == "PVT"; checks += 1
     assert classify_hardware_stage("9C020YCAC6") == "PVT"; checks += 1
 
+    ms, mu = redact_identifiers("9C020YCAC61234", "180b68a0-22f3-4411-f248-585dd92cd1dd")
+    assert ms == "9C020YCAC6XXXX"; checks += 1
+    assert mu == "180b68a0-XXXX-XXXX-XXXX-XXXXXXXXXXXX"; checks += 1
+
     b_bruce = decode_build_info_reply(struct.pack("<II", 337784, 3))
     assert b_bruce == {"build_number": 337784, "board_rev": 3, "firmware_family": "bruce"}; checks += 1
     b_gotham = decode_build_info_reply(struct.pack("<II", 282115, 2))
     assert b_gotham == {"build_number": 282115, "board_rev": 2, "firmware_family": "gotham"}; checks += 1
 
     assert decode_battery_reply(struct.pack("<H", 87)) == 87; checks += 1
-    assert decode_cstr(b"2019-10-15\x00\x00") == "2019-10-15"; checks += 1
+    assert decode_cstr(b"GA00722-US\x00\x00") == "GA00722-US"; checks += 1
 
     p_str = decode_provisioning_reply(b"ReadyForEndUserUse")
     assert p_str == {"state_name": "ReadyForEndUserUse", "state_code": 5}; checks += 1
@@ -242,9 +277,10 @@ def run_selftest():
 
 def print_report(info):
     print(f"Stadia Controller ({info['usb_id']}, vendor interface {info['interface']})")
-    print(f"  Serial           : {info['serial']} ({info['hardware_stage']})")
+    print(f"  USB Serial       : {info['serial'] or '<unavailable>'} ({info['hardware_stage']})")
+    print(f"  SsdpUdn (0x87)   : {info['ssdp_udn']}")
+    print(f"  SKU / ModelId    : {info['sku']!r} / {info['model_id']!r} (0x88 / 0x89)")
     print(f"  Firmware         : {info['firmware_family']} build {info['build_number']} (board_rev={info['board_rev']})")
-    print(f"  Mfg Date / Color : {info['mfg_date']!r} / {info['device_color']!r}")
     print(f"  Provisioning     : {info['provisioning_state']} (code={info['provisioning_code']})")
     polled_note = "polled via 0x83" if info["battery_polled"] else "cached (pass --poll-battery to refresh)"
     print(f"  Battery SoC      : {info['battery_soc_percent']}% ({polled_note})")
@@ -257,6 +293,7 @@ def print_report(info):
 def main():
     ap = argparse.ArgumentParser(description="Read-only USB EP0 diagnostics for Google Stadia Controller.")
     ap.add_argument("--poll-battery", action="store_true", help="Issue bRequest 0x83 and wait 500 ms before reading 0x84")
+    ap.add_argument("--redact", action="store_true", help="Mask serial suffix and SsdpUdn UUID for public logs")
     ap.add_argument("--json", action="store_true", help="Emit JSON output")
     ap.add_argument("--selftest", action="store_true", help="Run offline unit tests without hardware")
     args = ap.parse_args()
@@ -266,7 +303,7 @@ def main():
         return 0
 
     try:
-        info = query_controller(poll_battery=args.poll_battery)
+        info = query_controller(poll_battery=args.poll_battery, redact=args.redact)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
