@@ -44,27 +44,27 @@ Static disassembly of `gotham 337784` Slot A (`Board::Board()` @ `0x600717a0..0x
 
 - **17 Button & D-Pad GPIOs (`0x60102920` entries `idx = 0..16`, `board + 0x284 + idx * 0x3c`, registered at `0x60076698..0x600768bc` into `state[+0x210..+0x222]` and `[0x20002fc8 + 8..26]`, packed into the 3-byte button bitfield by ITCM `0x00002528` / `0x60042d44..0x60042e32`):**
 
-| `idx` | RT106x Pad | GPIO | `board` offset | Getter | `state` offset | Bitfield (`0x60042db6`) | Verified / Inferred Role |
+| `idx` | RT106x Pad | GPIO | `board` offset | Getter | `state` offset | Bitfield (`0x60042db6`) | Role (`0x60070744..0x60070a56` HID parsers) |
 |---:|---|---|---|---|---|---|---|
-| `0` | `GPIO_SD_B1_00` | `GPIO3_00` | `+0x284` | `0x60084b1c` | `+0x214` | `byte0` bit 6 | **D-Pad** (4-pin directional group summed at `0x60051358..0x60051376`) |
-| `1` | `GPIO_SD_B1_01` | `GPIO3_01` | `+0x2c0` | `0x60084b24` | `+0x215` | `byte0` bit 7 | **D-Pad** |
-| `2` | `GPIO_SD_B1_02` | `GPIO3_02` | `+0x2fc` | `0x60084b2c` | `+0x216` | `byte0` bit 4 | **D-Pad** |
-| `3` | `GPIO_SD_B1_03` | `GPIO3_03` | `+0x338` | `0x60084b34` | `+0x217` | `byte0` bit 5 | **D-Pad** |
-| `4` | `GPIO_B0_00` | `GPIO2_00` | `+0x374` | `0x60084acc` | `+0x210` | `byte0` bit 0 | System / function button (checked at `0x60071bc0`) |
-| `5` | `GPIO_B0_01` | `GPIO2_01` | `+0x3b0` | `0x60084afc` | `+0x211` | `byte0` bit 1 | System / function button |
-| `6` | `GPIO_B0_02` | `GPIO2_02` | `+0x3ec` | `0x60084ad4` | `+0x212` | `byte0` bit 2 | System / function button (checked at `0x60071bd8`) |
-| `7` | `GPIO_B0_03` | `GPIO2_03` | `+0x428` | `0x60084adc` | `+0x213` | `byte0` bit 3 | System / function button (checked at `0x60071bc8`) |
-| `8` | `GPIO_B0_11` | `GPIO2_11` | `+0x464` | `0x60084af4` | `+0x222` | `byte1` bit 4 | **`Y`** (confirmed by `"Y button held; enter setup mode."` at `0x6005142a`) |
-| `9` | `GPIO_B0_12` | `GPIO2_12` | `+0x4a0` | `0x60084ae4` | `+0x21e` | `byte1` bit 3 | **`L1`** (checked at `0x60071bb8`) |
-| `10` | `GPIO_B0_13` | `GPIO2_13` | `+0x4dc` | `0x60084b14` | `+0x21f` | `byte1` bit 2 | **`R1`** |
-| `11` | `GPIO_B0_14` | `GPIO2_14` | `+0x518` | `0x60084aec` | `+0x220` | `byte1` bit 1 | **`L3`** (left stick click) |
-| `12` | `GPIO_B0_15` | `GPIO2_15` | `+0x554` | `0x60084b3c` | `+0x221` | `byte1` bit 0 | **`R3`** (right stick click) |
-| `13` | `GPIO_AD_B0_00` | `GPIO1_00` | `+0x590` | `0x60084b44` | `+0x21c` | `byte1` bit 7 | **`A`** |
-| `14` | `GPIO_AD_B0_02` | `GPIO1_02` | `+0x5cc` | `0x60084b4c` | `+0x21d` | `byte2` bit 0 | **`Stadia`** (plus digital `L2`/`R2` thresholds from `+0x21a`/`+0x21b` into `byte2` bits 1–2) |
-| `15` | `GPIO_EMC_00` | `GPIO4_00` | `+0x608` | `0x60084b04` | `+0x218` | `byte1` bit 5 | **`X`** |
-| `16` | `GPIO_EMC_01` | `GPIO4_01` | `+0x644` | `0x60084b0c` | `+0x219` | `byte1` bit 6 | **`B`** |
+| `0` | `GPIO_SD_B1_00` | `GPIO3_00` | `+0x284` | `0x60084b1c` | `+0x214` | `byte0` bit 6 | **`D-Pad Up`** (`[r4+12]`) |
+| `1` | `GPIO_SD_B1_01` | `GPIO3_01` | `+0x2c0` | `0x60084b24` | `+0x215` | `byte0` bit 7 | **`D-Pad Down`** (`[r4+13]`) |
+| `2` | `GPIO_SD_B1_02` | `GPIO3_02` | `+0x2fc` | `0x60084b2c` | `+0x216` | `byte0` bit 4 | **`D-Pad Left`** (`[r4+14]`) |
+| `3` | `GPIO_SD_B1_03` | `GPIO3_03` | `+0x338` | `0x60084b34` | `+0x217` | `byte0` bit 5 | **`D-Pad Right`** (`[r4+15]`) |
+| `4` | `GPIO_B0_00` | `GPIO2_00` | `+0x374` | `0x60084acc` | `+0x210` | `byte0` bit 0 | **`A`** (`[r4+8]`) |
+| `5` | `GPIO_B0_01` | `GPIO2_01` | `+0x3b0` | `0x60084afc` | `+0x211` | `byte0` bit 1 | **`B`** (`[r4+9]`) |
+| `6` | `GPIO_B0_02` | `GPIO2_02` | `+0x3ec` | `0x60084ad4` | `+0x212` | `byte0` bit 2 | **`X`** (`[r4+10]`) |
+| `7` | `GPIO_B0_03` | `GPIO2_03` | `+0x428` | `0x60084adc` | `+0x213` | `byte0` bit 3 | **`Y`** (`[r4+11]`) |
+| `8` | `GPIO_B0_11` | `GPIO2_11` | `+0x464` | `0x60084af4` | `+0x222` | `byte1` bit 4 | **`Stadia`** (Home, `[r4+26]`) |
+| `9` | `GPIO_B0_12` | `GPIO2_12` | `+0x4a0` | `0x60084ae4` | `+0x21e` | `byte1` bit 3 | **`Options`** (`…`, `[r4+22]`) |
+| `10` | `GPIO_B0_13` | `GPIO2_13` | `+0x4dc` | `0x60084b14` | `+0x21f` | `byte1` bit 2 | **`Menu`** (`≡`, `[r4+23]`) |
+| `11` | `GPIO_B0_14` | `GPIO2_14` | `+0x518` | `0x60084aec` | `+0x220` | `byte1` bit 1 | **`Assistant`** (`[r4+24]`) |
+| `12` | `GPIO_B0_15` | `GPIO2_15` | `+0x554` | `0x60084b3c` | `+0x221` | `byte1` bit 0 | **`Capture`** (`[r4+25]`) |
+| `13` | `GPIO_AD_B0_00` | `GPIO1_00` | `+0x590` | `0x60084b44` | `+0x21c` | `byte1` bit 7 | **`L3`** (left stick click, `[r4+20]`; **hardware-verified**) |
+| `14` | `GPIO_AD_B0_02` | `GPIO1_02` | `+0x5cc` | `0x60084b4c` | `+0x21d` | `byte2` bit 0 | **`R3`** (right stick click, `[r4+21]`; `L2`/`R2` digital thresholds in `byte2` bits 1–2) |
+| `15` | `GPIO_EMC_00` | `GPIO4_00` | `+0x608` | `0x60084b04` | `+0x218` | `byte1` bit 5 | **`L1`** (`[r4+16]`; **hardware-verified**) |
+| `16` | `GPIO_EMC_01` | `GPIO4_01` | `+0x644` | `0x60084b0c` | `+0x219` | `byte1` bit 6 | **`R1`** (`[r4+17]`; **hardware-verified**) |
 
-*(Individual D-pad cardinal directions `Up/Down/Left/Right` and system buttons `Menu/Options/Assistant/Capture` within `idx=0..7` are assigned to `GPIO3_00..03` and `GPIO2_00..03` respectively.)*
+*(Exact 1:1 mapping cross-checked across all three Tandem HID parsers in `slot_a_bruce.bin`: DS3 Report `0x01` @ `0x60070744`, DS4 Report `0x01` @ `0x60070834`, and Stadia Report `0x03` @ `0x60070948`, all targeting canonical struct `0x20002fc8` `[+8..+26]`, and confirmed on live hardware via `L1`, `R1`, and `L3`.)*
 
 - **Broadcom `BCM43458F` Bluetooth HCI (`BLE_EN` @ `0x6006a390`, `BrcmPatchramStart` @ `0x60098820`):**
   - **`BT_REG_ON` (`BLE_EN`):** `GPIO_EMC_34` (`GPIO3_20`, `idx = 55`, `board + 0x1738`; optional 2nd pin `GPIO_EMC_41` / `GPIO3_27` at `board + 0x1814`).
@@ -72,7 +72,7 @@ Static disassembly of `gotham 337784` Slot A (`Board::Board()` @ `0x600717a0..0x
   - **Embedded `.hcd` `patchram` blob:** `0x6012f5d0..0x6013c69a` (`53,450 B`, `228` vendor commands: `0xfc2e` `Download_Minidriver` + `228` HCD packets `0xfc4c` `Write_RAM` .. `0xfc4e` `Launch_RAM`).
 
 - **I2C, SDIO, Audio & PWM buses (`0x60102d10..0x60102fa0`, `0x6007401a..0x600740d4`, `0x6007455c..0x60074580`):**
-  - **`LPI2C2` (`0x403F4000`, `GPIO_B0_04/05` `ALT2`, `board + 0xfa8`):** TI **LP5562** ring LED at `0x30` (`board + 0x4304`, `[LP5562+0] = NULL` — no external `EN` GPIO).
+  - **`LPI2C2` (`0x403F4000`, `GPIO_B0_04/05` `ALT2`, `board + 0xfa8`):** TI **LP5562** ring LED at `0x30` (`board + 0x4304`, `[LP5562+0] = NULL` — no external `EN` GPIO). **Hardware-verified channel wiring:** `W_PWM` (`0x0E`) = **White**, `G_PWM` (`0x03`) = **Orange / Amber**, `R_PWM` (`0x04`) = **Red**, `B_PWM` (`0x02`) = **unwired / no LED die** (writing only `B` turns the LED off).
   - **`LPI2C1` (`0x403F0000`, `GPIO_AD_B1_00/01` `ALT3`, `board + 0xf80`):** I2C peripherals at `0x6b` (`board + 0x431c`, charger/PMIC), `0x1a` (`board + 0x432c`, audio codec), `0x3b` (`board + 0x433c`, auxiliary device), and `0x55` (`board + 0x4348`, fuel gauge).
   - **`USDHC1` (`GPIO_SD_B0_00..05` `ALT0`):** `BCM43458F` SDIO WLAN.
   - **`SAI1` (`GPIO_AD_B1_09, 13, 14, 15` `ALT3`):** Headset audio I2S/MCLK.
