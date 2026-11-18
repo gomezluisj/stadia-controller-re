@@ -68,7 +68,8 @@ Static disassembly of `gotham 337784` Slot A (`Board::Board()` @ `0x600717a0..0x
 
 - **Broadcom `BCM43458F` Bluetooth HCI (`BLE_EN` @ `0x6006a390`, `BrcmPatchramStart` @ `0x60098820`):**
   - **`BT_REG_ON` (`BLE_EN`):** `GPIO_EMC_34` (`GPIO3_20`, `idx = 55`, `board + 0x1738`; optional 2nd pin `GPIO_EMC_41` / `GPIO3_27` at `board + 0x1814`).
-  - **`LPUART3` (`0x4018C000`, initial baud `115200` @ `0x6007302e`):** `GPIO_EMC_13` (`TX`, `0x401F8048=2`, `SELECT_INPUT 0x401F853C=1`), `GPIO_EMC_14` (`RX`, `0x401F804C=2`, `SELECT_INPUT 0x401F8538=1`), `GPIO_EMC_15` (`CTS_B`, `0x401F8050=2`, `SELECT_INPUT 0x401F8534=0`), `GPIO_EMC_16` (`RTS_B`, `0x401F8054=2`).
+  - **Power-on CTS strap sequence (`0x6006bf20` → `0x6006ec50` / `0x6006ec90`):** Before asserting `BT_REG_ON` (`GPIO3_20`), firmware muxes `GPIO_EMC_15` (`0x401F8050`) to `ALT5` (`GPIO4_15`) and drives it **LOW** during the 50 ms `BT_REG_ON` low/high reset pulse, then switches `GPIO_EMC_15` back to `ALT2` (`LPUART3_CTS_B`, `0x401F8534=0`).
+  - **`LPUART3` (`0x4018C000`, initial baud `115200` @ `0x6007302e`):** `GPIO_EMC_13` (`TX`, `0x401F8048=2`, `SELECT_INPUT 0x401F853C=1`), `GPIO_EMC_14` (`RX`, `0x401F804C=2`, `SELECT_INPUT 0x401F8538=1`), `GPIO_EMC_15` (`CTS_B`, `0x401F8050=2`, `SELECT_INPUT 0x401F8534=0`), `GPIO_EMC_16` (`RTS_B`, `0x401F8054=2`). Hardware flow control uses `LPUART3_MODIR` (`+0x24`, bit 3 `RXRTSE`) with TX/RX FIFOs enabled (`LPUART3_FIFO` `+0x28`).
   - **Embedded `.hcd` `patchram` blob:** `0x6012f5d0..0x6013c69a` (`53,450 B`, `228` vendor commands: `0xfc2e` `Download_Minidriver` + `228` HCD packets `0xfc4c` `Write_RAM` .. `0xfc4e` `Launch_RAM`).
 
 - **I2C, SDIO, Audio & PWM buses (`0x60102d10..0x60102fa0`, `0x6007401a..0x600740d4`, `0x6007455c..0x60074580`):**
