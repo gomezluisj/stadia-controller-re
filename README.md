@@ -33,12 +33,12 @@ Static disassembly of `gotham 337784` Slot A (`Board::Board()` @ `0x600717a0..0x
 
 | Input | ADC Channel | RT106x Pad | `board` offset (`0x200064c0`) | Consumer object |
 |---|---|---|---|---|
-| **Right Trigger (`R2`)** | `ADC1_IN7` | `GPIO_AD_B1_03` | `board + 0xb74` | `right_trigger` (`board + 0x6910`) |
-| **Left Joystick X (`LX`)** | `ADC1_IN8` | `GPIO_AD_B1_04` | `board + 0xbec` | `left_joystick + 0x54` (`board + 0x67fc`) |
-| **Left Joystick Y (`LY`)** | `ADC1_IN9` | `GPIO_AD_B1_05` | `board + 0xc28` | `left_joystick + 0x58` (`board + 0x67fc`) |
-| **Right Joystick X (`RX`)** | `ADC1_IN10` | `GPIO_AD_B1_06` | `board + 0xc64` | `right_joystick + 0x54` (`board + 0x67a0`) |
-| **Right Joystick Y (`RY`)** | `ADC1_IN11` | `GPIO_AD_B1_07` | `board + 0xca0` | `right_joystick + 0x58` (`board + 0x67a0`) |
-| **Left Trigger (`L2`)** | `ADC1_IN12` | `GPIO_AD_B1_08` | `board + 0xb38` | `left_trigger` (`board + 0x6858`) |
+| **Right Trigger (`R2`)** | `ADC1_IN8` (logical `7`) | `GPIO_AD_B1_03` | `board + 0xb74` | `right_trigger` (`board + 0x6910`) |
+| **Left Joystick X (`LX`)** | `ADC1_IN9` (logical `8`) | `GPIO_AD_B1_04` | `board + 0xbec` | `left_joystick + 0x54` (`board + 0x67fc`) |
+| **Left Joystick Y (`LY`)** | `ADC1_IN10` (logical `9`) | `GPIO_AD_B1_05` | `board + 0xc28` | `left_joystick + 0x58` (`board + 0x67fc`) |
+| **Right Joystick X (`RX`)** | `ADC1_IN11` (logical `10`) | `GPIO_AD_B1_06` | `board + 0xc64` | `right_joystick + 0x54` (`board + 0x67a0`) |
+| **Right Joystick Y (`RY`)** | `ADC1_IN12` (logical `11`) | `GPIO_AD_B1_07` | `board + 0xca0` | `right_joystick + 0x58` (`board + 0x67a0`) |
+| **Left Trigger (`L2`)** | `ADC1_IN13` (logical `12`) | `GPIO_AD_B1_08` | `board + 0xb38` | `left_trigger` (`board + 0x6858`) |
 
 *(Internal telemetry ADC channels also sit at `board + 0xbb0` on `ADC1` and `board + 0xd34` on `ADC2_IN15`.)*
 
