@@ -12,3 +12,6 @@ decomp_all.c
 __pycache__/
 *.pyc
 .DS_Store
+# Extracted Broadcom patchram header and bare-metal build outputs
+bcm43458f_hcd.h
+firmware/*/build/

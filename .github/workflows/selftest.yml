@@ -1,0 +1,22 @@
+name: Tool Selftests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run all tool selftests
+        run: |
+          for s in tools/*.py; do
+            echo "=== $s ==="
+            python3 "$s" --selftest
+          done

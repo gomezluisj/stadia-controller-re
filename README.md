@@ -33,6 +33,7 @@ Hardware pinout, NOR partition layout, BootROM/HABv4 security analysis, bare-met
 Run the built-in self-tests (requires Python 3, no hardware needed):
 
 ```bash
+python3 tools/extract_hcd.py --selftest
 python3 tools/ivt_csf_inspect.py --selftest
 python3 tools/kvs_parse.py --selftest
 python3 tools/nor_slice_inspect.py --selftest
@@ -44,13 +45,15 @@ python3 tools/stadia_diag.py --selftest
 | Path | Description |
 |---|---|
 | `docs/` | Modular technical reference (`hardware-pinout.md`, `boot-and-nor.md`, `bare-metal-bringup.md`, `security-audit.md`, `kvs-parser-spec.md`) |
+| `firmware/stadia-ram-hello/` | Bare-metal Cortex-M7 DTCM firmware (Switch Pro Controller over Classic BT HID + USB CDC-ACM console; excludes proprietary `.hcd` blob) |
+| `tools/extract_hcd.py` | Extracts `BCM43458F` `.hcd` `patchram` (`53,450 B`, 228 HCI packets) from a local `slot_a_bruce.bin` dump into `bcm43458f_hcd.h` |
 | `tools/kvs_parse.py` | Parser for NOR KVS partitions (`id=9`, `id=5`, `id=4`; supports `g={1,2,4,8,16}` and BEE AES-128-ECB classification) |
 | `tools/nor_slice_inspect.py` | Offline partition carver & inspector for raw NOR dumps (low 256 KiB, slots, or full 16 MiB) with PII redaction |
 | `tools/ivt_csf_inspect.py` | Offline parser & signed-span auditor for IVT, `BootData`, `BuildInfo`, and HABv4 CSF images |
 | `tools/stadia_diag.py` | Read-only USB HID / EP0 diagnostic tool querying safe vendor IN descriptors (`0x81`, `0x84`, `0x87`–`0x8a`, `0x8c`) |
 | `tools/udev/99-stadia-controller.rules` | Linux udev rules for App (`18d1:9400`), Bootloader (`18d1:946b`), SDP (`1fc9:0135`), and Flashloader (`15a2:0073`) |
 | `ghidra/` | Headless Ghidra scripts (`DecompAll.java`, `DecompForce.java`, `Xrefs.java`, `MapScatterLoad.java`) |
-| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI erase log (`flexspi_erase_verify.log`), and BLE input log (`ble_bruce_input.log`) |
+| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI/BLE logs, and live USB CDC-ACM captures (`cdc_i2c_scan.log`, `cdc_l2r2_gpio2_10.log`, `cdc_bt_sdp_hid.log`) |
 
 ---
 
