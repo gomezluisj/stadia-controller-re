@@ -1,0 +1,44 @@
+# Live USB CDC-ACM capture (redacted): FlexPWM4 haptics, real battery, RAM Link Key cache & Assistant re-pair
+# Host Bluetooth MAC redacted as XX XX XX XX XX XX; Link Key redacted by firmware as [KEY-REDACTED].
+# Hardware verified on PVT Google Stadia Controller (MIMXRT1061 + BCM43458F) booted via tools/boot_dtcm.py.
+
+=== 1. Boot, Battery (BQ2742X + BQ25601) & 30 kHz FlexPWM4 Verification ===
+=== STADIA DTCM CONSOLE READY ===
+BT=1 BD=43:45:C5:00:1F:AC
+BAT soc=100% mv=4325 chg08=3C hid=0x90
+PWM REGS: FSTS=0000 OUT=0C00 MC=0000 C2=2000 C=0464 D2=F000 V1=69 V3=0 CNT=0
+RUMBLE L=30 R=0 FSTS=00 MC=04
+RUMBLE L=0 R=0 FSTS=00 MC=00
+RUMBLE L=90 R=0 FSTS=00 MC=04
+PWM REGS: FSTS=0000 OUT=0C00 MC=0400 C2=2000 C=0464 D2=F000 V1=69 V3=60 CNT=11
+RUMBLE L=0 R=0 FSTS=00 MC=00
+RUMBLE L=0 R=90 FSTS=00 MC=08
+RUMBLE L=0 R=0 FSTS=00 MC=00
+
+=== 2. Bluetooth Pairing, RAM Link Key Cache, BT HID Rumble (A2 10), Fast Reconnect & Assistant Re-Pair ===
+HCI EVT: 03 0B 00 0B 00 XX XX XX XX XX XX 01 00
+HCI EVT: 18 17 XX XX XX XX XX XX [KEY-REDACTED] 04
+BT LINK KEY CACHED slot=0
+HCI EVT: 08 04 00 0B 00 01
+ACL RX: 0B 20 35 00 31 00 42 00 A2 01 07 00 01 40 40 00 01 40 40 48 01 00 00 00 00 00 00 00 00 00 00 00 ...
+ACL TX[3309]: A1 21 1D 90 00 00 00 00 08 80 00 C8 7F 08 80 48 00 00 00 00 00 00 00 00 ...
+# Bluetooth HID Output Report 0x10 (Left motor 100%, then Right motor 100%):
+ACL RX: 0B 20 0F 00 0B 00 42 00 A2 10 01 C2 18 03 72 00 01 40 40
+RUMBLE L=100 R=0 FSTS=00 MC=04
+RUMBLE L=0 R=0 FSTS=00 MC=00
+ACL RX: 0B 20 0F 00 0B 00 42 00 A2 10 03 00 01 40 40 C2 18 03 72
+RUMBLE L=0 R=100 FSTS=00 MC=08
+RUMBLE L=0 R=0 FSTS=00 MC=00
+# Host disconnect -> reconnect same session (RAM Link Key hit, instant encryption without re-pairing):
+HCI EVT: 05 04 00 0B 00 13
+HCI EVT: 03 0B 00 0B 00 XX XX XX XX XX XX 01 00
+HCI EVT: 17 06 XX XX XX XX XX XX
+BT LINK KEY HIT -> FAST RECONNECT
+HCI EVT: 08 04 00 0B 00 01
+# Hold Assistant (~1.0 s) -> disconnect (0x16), clear peer Link Key, re-enter discoverable scan:
+BT RE-PAIR (Assistant)
+HCI EVT: 05 04 00 0B 00 16
+HCI EVT: 03 0B 00 0B 00 XX XX XX XX XX XX 01 00
+HCI EVT: 18 17 XX XX XX XX XX XX [KEY-REDACTED] 04
+BT LINK KEY CACHED slot=0
+HCI EVT: 08 04 00 0B 00 01

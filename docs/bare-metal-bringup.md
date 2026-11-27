@@ -8,10 +8,13 @@ This document summarizes the hardware-verified bring-up sequence for running cus
 
 ## 1. Execution Path (`ROMC` Session Mode)
 
-1. Put the controller in NXP BootROM SDP mode (`1fc9:0135`).
-2. Run [`tchebb/nxp-sdp-overrun`](https://github.com/tchebb/nxp-sdp-overrun) to unlock HAB for the current boot session (`REPORT_STATUS` returns `hab=0x56787856`).
-3. Upload an unsigned IVT image (`csf = 0`, entry in DTCM `0x20000400`) via `SDP WRITE_FILE (0x0404)` to `0x20000000` and execute via `SDP JUMP_ADDRESS (0x0b0b)` to `0x20000400`.
-4. Note: `SDP READ_REGISTER` remains masked in `ROMC` session mode (`0x89232389` / `4323ccdc7eba4de9`); for NOR preservation dumps or `OCOTP` reads, load a standard `MIMXRT1062` `ivt_flashloader.bin` (`15a2:0073`, `blhost`).
+1. Put the controller in NXP BootROM SDP mode (`1fc9:0135`): hold **`Options + Assistant + A + Y`** while plugging in USB-C.
+2. Run the one-command loader [`tools/boot_dtcm.py`](../tools/boot_dtcm.py) (requires `hidapi`):
+   ```bash
+   python3 tools/boot_dtcm.py --bin firmware/stadia-ram-hello/build/stadia_hello.bin --console
+   ```
+   It queries `SDP ERROR_STATUS`, invokes [`tchebb/nxp-sdp-overrun`](https://github.com/tchebb/nxp-sdp-overrun) automatically if HAB is Closed (`0x12343412`), verifies HAB Open (`0x56787856`), uploads the unsigned IVT image (`csf = 0`) via `SDP WRITE_FILE (0x0404)` to `0x20000000`, jumps via `SDP JUMP_ADDRESS (0x0b0b)` to `0x20000400`, and optionally attaches to the live USB CDC-ACM console.
+3. Note: `SDP READ_REGISTER` remains masked in `ROMC` session mode (`0x89232389` / `4323ccdc7eba4de9`); for NOR preservation dumps or `OCOTP` reads, load a standard `MIMXRT1062` `ivt_flashloader.bin` (`15a2:0073`, `blhost`).
 
 ---
 
@@ -34,8 +37,14 @@ This document summarizes the hardware-verified bring-up sequence for running cus
   - Measured 12-bit ranges with `GPIO2_10 = 0`:
     - `R2` (`ADC1_IN8`, `GPIO_AD_B1_03`): idle `~1747`, full press `~616`.
     - `L2` (`ADC1_IN13`, `GPIO_AD_B1_08`): idle `~1734`, full press `~578`.
-- **`LPI2C1` (`0x403F0000`, `GPIO_AD_B1_00/01` `ALT3`):**
-  - `0x1A` (`WM8904` codec), `0x3B` (`TS3A227E` 3.5 mm jack switch, `reg 0x00 = 0x11`, regs `0x00..0x1C`), `0x55` (`BQ2742X` fuel gauge, requires `GPOUT` toggle to wake), `0x6B` (`BQ25601` charger).
+- **`LPI2C1` (`0x403F0000`, `GPIO_AD_B1_00/01` `ALT3`, `MCFGR1 = 1` `/2` prescaler — all 4 chips verified):**
+  - `0x1A` (`WM8904` codec), `0x3B` (`TS3A227E` 3.5 mm jack switch), `0x55` (`BQ2742X` fuel gauge — pulse `GPIO2_28` `HIGH→LOW→HIGH→Hi-Z` at boot to exit shutdown, then read SOC @ `0x1C` & mV @ `0x04` to populate Switch Pro HID battery byte `pkt[3]`), `0x6B` (`BQ25601` charger — charging/VBUS bits in `REG08`).
+- **Haptics / Rumble (`FlexPWM4` SM2/SM3 Ch A + `XBARA1`):**
+  - Enable `XBARA1` (`CCM_CCGR2` bits `23:22`) and route `LOGIC_HIGH (0x01)` to `FLEXPWM4_FAULT0..3` (`0x13F`, `0x140`, `0x125`, `0x126`), plus clear `SM[2..3].DISMAP0 (+0x2C) = 0` (**never** write `DISMAP1 +0x2E`, reserved on `MIMXRT1061` → BusFault).
+  - Configure `SM2` (`GPIO_B1_14` `ALT1`, `GPIO2_16` active-LOW EN) and `SM3` (`GPIO_B1_15` `ALT1`, `GPIO2_17` active-LOW EN) matching stock `PWM_Init` + `PWM_SetupPwm`: `CTRL2 = INDEP | FORCE`, `CTRL = FULL | PRSC(/64) | LDMOD`, `VAL1 = 69` (~30 kHz @ 132 MHz IPG / 64), `LDOK` before `RUN` (no `CLDOK`). Decode Switch HD rumble (`A2 10` / `A2 01`, gated by `subcmd 0x48`) with a ~1.5 s safety watchdog.
+- **On-controller shortcuts (`stadia-ram-hello`):**
+  - Hold **`Assistant`** (~1 s): flashes green, disconnects active peer, evicts its RAM `Link Key`, and re-enters discoverable scan.
+  - Hold **`Stadia + Assistant`** (~2.5 s, unplugged): flashes red and executes stock `PMIC_KILL` (`GPIO4_03 = 0`, then `GPIO4_02 = 1`) for clean hardware power-off.
 
 ---
 
@@ -53,6 +62,8 @@ This document summarizes the hardware-verified bring-up sequence for running cus
    - Enable Role Switch + Sniff Mode via `HCI_Write_Default_Link_Policy_Settings (0x080F)` = `0x0005` (Switch 2 immediately enters Sniff Mode `HCI EVT 0x14` after L2CAP `0x0011`/`0x0013` open).
    - Echo the incoming MTU option (`01 02 A0 02`) in `L2CAP_Configuration_Response (0x05)`.
    - Keep `0x3F` mode event-driven (no unsolicited `0x3F` flood right after `0x0013` opens); pressing `L + R` triggers Switch 2's full Pro Controller init sequence (`0x02`, `0x08`, `0x10`, `0x03 0x30`, `0x40`, `0x30`, `0x48`).
-7. **Verified end-to-end on macOS & Nintendo Switch 2:**
-   - **macOS (`GameController.framework`):** enumerates natively as `Switch Pro Controller` (`extendedGamepad = true`); all buttons (`A/B/X/Y`, `L1/R1`, `L2/ZL` & `R2/ZR` with zero-chatter hysteresis, `L3/R3`, `Plus/Minus`, 4-way `D-Pad`) and all 4 analog axes (`LX/LY`, `RX/RY` reaching `[-1.00..+1.00]`) verified live.
+7. **RAM `Link Key` cache (same-session instant reconnect):**
+   - Cache up to 4 `(bd_addr, link_key)` entries from `HCI_Link_Key_Notification (0x18)` (redacted in CDC logs), reply to `HCI_Link_Key_Request (0x17)` with `0x040B` (`Link_Key_Request_Reply`) for instant encrypted reconnect without re-pairing, and auto-evict on `HCI_Authentication_Complete (0x06)` failure.
+8. **Verified end-to-end on macOS & Nintendo Switch 2:**
+   - **macOS (`GameController.framework` & HID):** enumerates natively as `Switch Pro Controller` (`extendedGamepad = true`); all buttons (`A/B/X/Y`, `L1/R1`, `L2/ZL` & `R2/ZR` with zero-chatter hysteresis, `L3/R3`, `Plus/Minus`, 4-way `D-Pad`), all 4 analog axes (`[-1.00..+1.00]`), real battery + charging nibble (`0x90`), Bluetooth HD rumble (`A2 10` Left & Right motors), RAM `Link Key` fast reconnect, `Assistant` re-pair, and `Stadia + Assistant` `PMIC_KILL` power-off verified live.
    - **Nintendo Switch 2:** pairs via *Controllers → Change Grip/Order* (`L + R`), completes full Pro Controller init, and all buttons, triggers (`L2`/`R2`), and sticks work live.

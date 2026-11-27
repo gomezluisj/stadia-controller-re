@@ -65,10 +65,18 @@ Static disassembly of `gotham 337784` Slot A (`Board::Board()` @ `0x600717a0..0x
 
 - **I2C, SDIO, Audio & PWM buses (`0x60102d10..0x60102fa0`, `0x6007401a..0x600740d4`, `0x6007455c..0x60074580`):**
   - **`LPI2C2` (`0x403F4000`, `GPIO_B0_04/05` `ALT2`, `board + 0xfa8`):** TI **LP5562** ring LED at `0x30` (`board + 0x4304`, `[LP5562+0] = NULL` — no external `EN` GPIO). **Hardware-verified channel wiring:** `W_PWM` (`0x0E`) = **White**, `G_PWM` (`0x03`) = **Orange / Amber**, `R_PWM` (`0x04`) = **Red**, `B_PWM` (`0x02`) = **unwired / no LED die** (writing only `B` turns the LED off).
-  - **`LPI2C1` (`0x403F0000`, `GPIO_AD_B1_00/01` `ALT3`, `board + 0xf80`):** I2C peripherals at `0x6b` (`board + 0x4364`, TI **`BQ25601`** battery charger), `0x1a` (`board + 0x432c`, **`WM8904`** audio codec; **hardware-verified**), `0x3b` (`board + 0x433c`, TI **`TS3A227E`** 3.5 mm headset jack detect switch, `reg 0x00 = 0x11`, regs `0x00..0x1C`; **hardware-verified**), and `0x55` (`board + 0x4348`, TI **`BQ2742X`** fuel gauge, requires `GPOUT` toggle to exit shutdown).
+  - **`LPI2C1` (`0x403F0000`, `GPIO_AD_B1_00/01` `ALT3`, `board + 0xf80`, use `MCFGR1 = 1` `/2` prescaler for ≤400 kHz compatibility — all 4 devices hardware-verified):**
+    - `0x1A` (`board + 0x432c`, **`WM8904`** audio codec, `reg 0x00 = 0x89`)
+    - `0x3B` (`board + 0x433c`, TI **`TS3A227E`** 3.5 mm headset jack detect switch, `reg 0x00 = 0x11`, regs `0x00..0x1C`)
+    - `0x55` (`board + 0x4348`, TI **`BQ2742X`** fuel gauge; requires `GPOUT` wake pulse on **`GPIO_B1_12` / `GPIO2_28`** (`0x401F81AC = ALT5`, `0x60068a00`: `HIGH → LOW ~2 ms → HIGH ~2 ms → Hi-Z`) to exit shutdown; SOC @ `0x1C`, Voltage @ `0x04`)
+    - `0x6B` (`board + 0x4364`, TI **`BQ25601`** battery charger; status in `REG08` — e.g., `0x3C` = VBUS Good / Charge Done, `REG0B = 0x11`)
   - **`USDHC1` (`GPIO_SD_B0_00..05` `ALT0`):** `BCM43458F` SDIO WLAN.
-  - **`SAI1` (`GPIO_AD_B1_09, 13, 14, 15` `ALT3`):** Headset audio I2S/MCLK.
-  - **Haptic / rumble motors (`0x6007455c..0x60074580`):** `GPIO_B1_00` (`GPIO2_16`, `idx = 25`, `board + 0x800`) and `GPIO_B1_01` (`GPIO2_17`, `idx = 26`, `board + 0x82c`) paired with `PWM1..4` (`0x403DC000..0x403E8000`) objects at `board + 0x1488` and `board + 0x1544`.
+  - **`SAI1` (`0x40384000`, `ALT3`):** Headset audio I2S/MCLK to `WM8904` — `GPIO_AD_B1_09` (`0x401F8120 = 3`, `sel 0x401F858C = 1`, `SAI1_MCLK`), `GPIO_AD_B1_14` (`0x401F8134 = 3`, `sel 0x401F85A8 = 1`, `SAI1_TX_BCLK`), `GPIO_AD_B1_13` (`0x401F8130 = 3`, `SAI1_TX_DATA00`), `GPIO_AD_B1_15` (`SAI1_TX_SYNC`).
+  - **Haptic / rumble motors (`FlexPWM4` @ `0x403E8000`, `CCM_CCGR4` bits `23:22`, 30 kHz edge-aligned, hardware-verified):**
+    - **Left motor (heavy ERM):** `FLEXPWM4_PWMA02` (SM2 Ch A) on **`GPIO_B1_14`** (`0x401F81B4 = ALT1`, `sel 0x401F849C = 1`) + active-LOW driver enable **`GPIO_B1_00` (`GPIO2_16`, `0x401F817C = ALT5`, `0` = ON, `1` = OFF)**.
+    - **Right motor (lighter ERM):** `FLEXPWM4_PWMA03` (SM3 Ch A) on **`GPIO_B1_15`** (`0x401F81B8 = ALT1`, `sel 0x401F84A0 = 1`) + active-LOW driver enable **`GPIO_B1_01` (`GPIO2_17`, `0x401F8180 = ALT5`, `0` = ON, `1` = OFF)**.
+    - **`XBARA1` (`0x403BC000`, `CCM_CCGR2` bits `23:22`, `0x600d4a6c`):** Routes `LOGIC_HIGH` (`0x01`) to `FLEXPWM4_FAULT0..3` (`0x13F`, `0x140`, `0x125`, `0x126`) so active-LOW faults do not mask `PWMA`; also clear `SM[2..3].DISMAP0 (+0x2C) = 0` (**do not** write `DISMAP1 (+0x2E)`, which is reserved on `MIMXRT1061` and triggers a BusFault).
+  - **Clean power-off (`PMIC_KILL`, `0x600510c0`, hardware-verified on battery):** Drive **`GPIO_EMC_03` (`GPIO4_03`, `0x401F8020 = ALT5`) LOW**, then drive **`GPIO_EMC_02` (`GPIO4_02`, `0x401F801C = ALT5`, `PMIC_KILL`) HIGH**.
 
 ---
 

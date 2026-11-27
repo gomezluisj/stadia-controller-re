@@ -1,5 +1,12 @@
 # Live USB CDC-ACM LPI2C1/LPI2C2 scan on PVT Stadia Controller (bare-metal DTCM)
-# bus=1 0x1A = WM8904, bus=1 0x3B = TS3A227E (regs 0x00..0x1C), bus=2 0x30 = LP5562
+# LPI2C1 configured with MCFGR1=/2 prescaler (~200-400 kHz) and BQ2742X GPOUT (GPIO2_28) wake pulse.
+# All 5/5 I2C peripherals discovered:
+#   bus=1 0x1A = WM8904 audio codec (reg 0x00 = 0x89)
+#   bus=1 0x3B = TS3A227E 3.5 mm headset jack switch (reg 0x00 = 0x11, regs 0x00..0x1C)
+#   bus=1 0x55 = BQ2742X battery fuel gauge (SOC=100% @ 0x1C=0x0064, V=4323 mV @ 0x04=0x10E3)
+#   bus=1 0x6B = BQ25601 battery charger (REG08=0x3C VBUS Good / Charge Done, REG0B=0x11)
+#   bus=2 0x30 = LP5562 RGBW ring LED driver (reg 0x00 = 0x40)
+BAT soc=100% mv=4323 chg08=3C hid=0x90
 I2C SCAN START
 I2C CHIP bus=1 addr=0x1A
   00: 89 00 00 00 00 00 00 00 00 96 00 00 00 00 00 00
@@ -19,8 +26,26 @@ I2C CHIP bus=1 addr=0x3B
   50: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
   60: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
   70: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+I2C CHIP bus=1 addr=0x55
+  00: 93 22 A9 0B E3 10 08 02 99 07 99 07 91 07 91 07
+  10: 00 00 00 00 00 00 D0 07 00 00 4E 00 64 00 A9 0B
+  20: 60 00 00 00 CF 10 00 00 91 07 91 07 91 07 91 07
+  30: 64 00 -- -- -- -- -- -- -- -- -- -- -- -- -- 00
+  40: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  50: FF FF FF FF FF -- -- -- -- -- -- -- -- -- -- --
+  60: -- -- -- -- A5 -- 6F 00 90 00 99 07 FC FF FC FF
+  70: 8C 3E -- -- -- -- -- -- -- 3B FF FF E2 10 A9 0B
+I2C CHIP bus=1 addr=0x6B
+  00: 64 1A 90 11 79 8F 66 08 3C 00 E0 11 FF FF FF FF
+  10: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  20: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  30: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  40: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  50: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  60: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+  70: FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
 I2C CHIP bus=2 addr=0x30
-  00: 40 00 00 00 00 FF FF FF 01 00 00 00 00 00 00 FF
+  00: 40 00 00 00 00 FF FF FF 01 00 00 00 00 00 FF FF
   10: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   30: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

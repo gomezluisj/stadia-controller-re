@@ -7,7 +7,8 @@ No copyrighted firmware binaries are hosted here — only hashes, console excerp
 | `SHA256SUMS.txt` | §8 reference hashes (slot/bootloader/flashloader artifacts only; excludes KVS/full-NOR dump) |
 | `flexspi_erase_verify.log` | §3 arbitrary erase primitive (abridged REV 4.1 console summary, not a raw HID wire capture) |
 | `ble_bruce_input.log` | §6 BLE HOGP input flow under bruce (`/dev/input/js0`) |
-| `cdc_i2c_scan.log` | Live `LPI2C1`/`LPI2C2` register dump (`0x1A` `WM8904`, `0x3B` `TS3A227E`, `0x30` `LP5562`) |
+| `cdc_i2c_scan.log` | Complete 5/5 live `LPI2C1`/`LPI2C2` register dump (`0x1A` `WM8904`, `0x3B` `TS3A227E`, `0x55` `BQ2742X`, `0x6B` `BQ25601`, `0x30` `LP5562`) |
 | `cdc_l2r2_gpio2_10.log` | 15-GPIO sweep proving active-LOW `GPIO2_10 = 0` powers `L2`/`R2` Hall triggers (`IN8`/`IN13`) + full-press ranges |
 | `cdc_bt_sdp_hid.log` | Redacted Classic BT HCI/ACL trace of paginated SDP, SSP + encryption, and Switch Pro Controller HID bring-up on macOS |
 | `cdc_switch2_bt_hid.log` | Redacted Classic BT HCI/ACL trace of Nintendo Switch 2 pairing (`Auth=0x04`, Sniff Mode, L2CAP MTU echo, `L+R` `0x3F`, full Pro Controller init) |
+| `cdc_haptics_battery_linkkey.log` | Redacted live capture of 30 kHz `FlexPWM4` haptics (CDC + BT HID `A2 10`), real `BQ2742X`/`BQ25601` battery, RAM `Link Key` fast reconnect, and `Assistant` re-pair |

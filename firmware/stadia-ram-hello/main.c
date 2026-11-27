@@ -156,6 +156,13 @@ typedef struct {
 #define LPI2C3_BASE 0x403F8000u
 #define LPI2C4_BASE 0x403FC000u
 
+/* FlexPWM4 for Left (SM2 Ch A / GPIO_B1_14) & Right (SM3 Ch A / GPIO_B1_15) haptics
+ * and XBARA1 (0x403BC000) to tie active-LOW FLEXPWM4_FAULT0..3 to LOGIC_HIGH.
+ * PRSC=6 (/64) @ 132 MHz IPG_CLK -> 2.0625 MHz; VAL1=69 -> ~29.9 kHz (matches stock). */
+#define PWM4_BASE        0x403E8000u
+#define XBARA1_BASE      0x403BC000u
+#define PWM4_PERIOD_VAL1 69u
+
 static void delay_cycles(volatile uint32_t n) {
     while (n--) {
         __asm__ volatile ("nop");
@@ -166,8 +173,8 @@ static void lpi2c_init(uint32_t base) {
     LPI2C_MCR(base) = (1u << 1); /* RST */
     delay_cycles(1000u);
     LPI2C_MCR(base) = 0u;
-    LPI2C_MCFGR1(base) = 0u;
-    LPI2C_MCCR0(base) = (0x0Au << 24) | (0x14u << 16) | (0x1Cu << 8) | 0x28u;
+    LPI2C_MCFGR1(base) = 1u; /* PRESCALE=/2 -> ~50-300 kHz across 10-60 MHz root */
+    LPI2C_MCCR0(base) = (0x0Au << 24) | (0x14u << 16) | (0x28u << 8) | 0x38u;
     LPI2C_MFCR(base) = 0u;
     LPI2C_MCR(base) = 1u; /* MEN */
 }
@@ -256,6 +263,43 @@ stop_err:
     return -1;
 }
 
+static int lpi2c_read_u16_le(uint32_t base, uint8_t addr7, uint8_t reg, uint16_t *out) {
+    lpi2c_recover(base);
+    if (lpi2c_wait_tx(base) < 0) return -1;
+    LPI2C_MTDR(base) = 0x400u | ((uint32_t)addr7 << 1);
+    if (lpi2c_wait_tx(base) < 0) goto stop_err;
+    LPI2C_MTDR(base) = reg;
+    if (lpi2c_wait_tx(base) < 0) goto stop_err;
+    LPI2C_MTDR(base) = 0x400u | ((uint32_t)addr7 << 1) | 1u;
+    if (lpi2c_wait_tx(base) < 0) goto stop_err;
+    LPI2C_MTDR(base) = 0x101u; /* RX 2 bytes */
+    if (lpi2c_wait_tx(base) < 0) goto stop_err;
+    LPI2C_MTDR(base) = 0x200u; /* STOP */
+    uint8_t b[2] = { 0u, 0u };
+    for (uint32_t idx = 0u; idx < 2u; ++idx) {
+        int got = 0;
+        for (uint32_t i = 0u; i < 100000u; ++i) {
+            uint32_t msr = LPI2C_MSR(base);
+            if (msr & (1u << 10)) goto stop_err;
+            uint32_t mrdr = LPI2C_MRDR(base);
+            if ((mrdr & (1u << 14)) == 0u) {
+                b[idx] = (uint8_t)(mrdr & 0xFFu);
+                got = 1;
+                break;
+            }
+        }
+        if (!got) goto stop_err;
+    }
+    (void)lpi2c_wait_stop(base);
+    *out = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+    return 0;
+stop_err:
+    LPI2C_MTDR(base) = 0x200u;
+    delay_cycles(5000u);
+    lpi2c_recover(base);
+    return -1;
+}
+
 typedef struct {
     uint32_t base;
     uint32_t mux_scl;
@@ -278,6 +322,17 @@ static const lpi2c_pins_t k_i2c_candidates[] = {
     /* LPI2C4: GPIO_AD_B0_12 (SCL) / GPIO_AD_B0_13 (SDA) */
     { LPI2C4_BASE, 0x401F80ECu, 0x401F80F0u, 0x10u, 0x401F82DCu, 0x401F82E0u, 0x401F84E4u, 0x401F84E8u, 1u },
 };
+
+static void i2c_ensure_bus(uint32_t idx) {
+    const lpi2c_pins_t *p = &k_i2c_candidates[idx];
+    REG32(p->mux_scl) = p->mux_val;
+    REG32(p->mux_sda) = p->mux_val;
+    REG32(p->pad_scl) = 0xD8B0u;
+    REG32(p->pad_sda) = 0xD8B0u;
+    REG32(p->sel_scl) = p->sel_val;
+    REG32(p->sel_sda) = p->sel_val;
+    lpi2c_init(p->base);
+}
 
 static int probe_lp5562(uint32_t *out_base, uint8_t *out_addr) {
     for (uint32_t c = 0; c < sizeof(k_i2c_candidates) / sizeof(k_i2c_candidates[0]); ++c) {
@@ -431,6 +486,243 @@ static void adc1_init_sticks(uint16_t idle_sticks[6]) {
     if (idle_sticks[5] < 1500u) idle_sticks[5] = 1735u;
 }
 
+/* Haptics: FlexPWM4 SM2 Ch A (GPIO_B1_14) + GPIO2_16 (Left),
+ *          FlexPWM4 SM3 Ch A (GPIO_B1_15) + GPIO2_17 (Right).
+ * GPIO2_16 / GPIO2_17 are active-LOW motor driver enables (0=ON, 1=OFF). */
+static uint8_t g_rumble_l = 0u;
+static uint8_t g_rumble_r = 0u;
+static uint32_t g_rumble_wdog = 0u;
+
+static void haptics_gpio_safe_off(void) {
+    /* Force active-LOW enables HIGH (disabled) BEFORE enabling output drivers */
+    IOMUXC_GPR_GPR(1) &= ~((1u << 16) | (1u << 17));
+    REG32(0x401F817Cu) = 5u;      /* GPIO_B1_00 -> GPIO2_16 (Left EN) */
+    REG32(0x401F836Cu) = 0x10B0u;
+    REG32(0x401F8180u) = 5u;      /* GPIO_B1_01 -> GPIO2_17 (Right EN) */
+    REG32(0x401F8370u) = 0x10B0u;
+    GPIO_DR(GPIO2_BASE) |= (1u << 16) | (1u << 17);
+    GPIO_GDIR(GPIO2_BASE) |= (1u << 16) | (1u << 17);
+    g_rumble_l = 0u;
+    g_rumble_r = 0u;
+    g_rumble_wdog = 0u;
+}
+
+static void xbara1_set_conn(uint16_t out_sig, uint8_t in_sig) {
+    uint32_t reg_off = (uint32_t)(out_sig & 0xFEu);
+    uint32_t shift = (out_sig & 1u) ? 8u : 0u;
+    uint16_t v = REG16(XBARA1_BASE + reg_off);
+    v = (uint16_t)((v & (uint16_t)~(0xFFu << shift)) | (uint16_t)((uint16_t)in_sig << shift));
+    REG16(XBARA1_BASE + reg_off) = v;
+}
+
+static void haptics_pwm_init(void) {
+    /* Enable XBARA1 clock and route active-LOW FLEXPWM4_FAULT0..3 to LOGIC_HIGH (0x01),
+     * matching stock slot_a_bruce.bin @ 0x600d4a6c. */
+    CCM_CCGR2 |= (3u << 22);
+    __asm__ volatile ("dsb sy");
+    xbara1_set_conn(0x13Fu, 0x01u); /* FLEXPWM4_FAULT0 -> LOGIC_HIGH */
+    xbara1_set_conn(0x140u, 0x01u); /* FLEXPWM4_FAULT1 -> LOGIC_HIGH */
+    xbara1_set_conn(0x125u, 0x01u); /* FLEXPWM1..4_FAULT2 -> LOGIC_HIGH */
+    xbara1_set_conn(0x126u, 0x01u); /* FLEXPWM1..4_FAULT3 -> LOGIC_HIGH */
+
+    /* Mux FlexPWM4_PWMA02 (GPIO_B1_14) and FlexPWM4_PWMA03 (GPIO_B1_15) */
+    REG32(0x401F81B4u) = 1u;      /* ALT1: FLEXPWM4_PWMA02 */
+    REG32(0x401F849Cu) = 1u;      /* FLEXPWM4_PWMA2_SELECT_INPUT */
+    REG32(0x401F83A4u) = 0x10B0u;
+    REG32(0x401F81B8u) = 1u;      /* ALT1: FLEXPWM4_PWMA03 */
+    REG32(0x401F84A0u) = 1u;      /* FLEXPWM4_PWMA3_SELECT_INPUT */
+    REG32(0x401F83A8u) = 0x10B0u;
+
+    /* Configure FlexPWM4 SM2 and SM3 matching stock PWM_Init + PWM_SetupPwm
+     * (slot_a_bruce.bin @ 0x60053d08, 0x600cf510, 0x600d4b78).
+     * Never touch DISMAP1 (+0x2E) — reserved on MIMXRT1061 (causes BusFault). */
+    REG16(PWM4_BASE + 0x188u) &= (uint16_t)~((1u << 10) | (1u << 11)); /* Stop RUN */
+    REG16(PWM4_BASE + 0x18Eu) |= 0x000Fu; /* FSTS0: clear latched fault flags */
+    REG16(PWM4_BASE + 0x190u) = 0x0000u;  /* FFILT0 */
+    REG16(PWM4_BASE + 0x182u) = 0x0000u;  /* MASK: unmasked */
+    for (uint32_t sm = 2u; sm <= 3u; ++sm) {
+        uint32_t sb = PWM4_BASE + (sm * 0x60u);
+        REG16(sb + 0x2Cu) = 0x0000u;                              /* DISMAP0: disable fault gating */
+        REG16(sb + 0x04u) = (1u << 13);                           /* CTRL2: INDEP=1 */
+        REG16(sb + 0x06u) = (1u << 10) | (6u << 4) | (1u << 2);   /* CTRL: FULL=1, PRSC=6 (/64), LDMOD=1 */
+        REG16(sb + 0x04u) |= (1u << 6);                           /* CTRL2: FORCE */
+        REG16(sb + 0x02u) = 0x0000u;                              /* INIT */
+        REG16(sb + 0x0Au) = (uint16_t)(PWM4_PERIOD_VAL1 / 2u);    /* VAL0 */
+        REG16(sb + 0x0Eu) = PWM4_PERIOD_VAL1;                     /* VAL1 */
+        REG16(sb + 0x12u) = 0x0000u;                              /* VAL2 (PWMA on) */
+        REG16(sb + 0x16u) = 0x0000u;                              /* VAL3 (PWMA off = 0%) */
+        REG16(sb + 0x30u) = 0x0000u;                              /* DTCNT0 */
+        REG16(sb + 0x22u) = 0x0000u;                              /* OCTRL: active-HIGH */
+        REG16(PWM4_BASE + 0x180u) |= (uint16_t)(1u << (8u + sm)); /* OUTEN: SM2/SM3 PWMA */
+    }
+    /* Immediate load (LDMOD=1) of INIT/VAL0/VAL1/VAL2/VAL3 into active registers */
+    REG16(PWM4_BASE + 0x188u) |= (uint16_t)((1u << 2) | (1u << 3));
+    for (uint32_t i = 0u; i < 1000u; ++i) {
+        if ((REG16(PWM4_BASE + 0x188u) & ((1u << 2) | (1u << 3))) == 0u) {
+            break;
+        }
+    }
+    REG16(PWM4_BASE + 0x18Eu) |= 0x000Fu;
+}
+
+#if STADIA_DEBUG_CONSOLE
+static void haptics_print_regs(const char *tag) {
+    uint16_t fsts = REG16(PWM4_BASE + 0x18Eu);
+    uint16_t outen = REG16(PWM4_BASE + 0x180u);
+    uint16_t mctrl = REG16(PWM4_BASE + 0x188u);
+    uint16_t c2 = REG16(PWM4_BASE + 0xC0u + 0x04u);
+    uint16_t c = REG16(PWM4_BASE + 0xC0u + 0x06u);
+    uint16_t v1 = REG16(PWM4_BASE + 0xC0u + 0x0Eu);
+    uint16_t v3 = REG16(PWM4_BASE + 0xC0u + 0x16u);
+    uint16_t cnt2 = REG16(PWM4_BASE + 0xC0u + 0x00u);
+    uint16_t dis2 = REG16(PWM4_BASE + 0xC0u + 0x2Cu);
+    usb_cdc_puts(tag);
+    usb_cdc_puts(" FSTS="); usb_cdc_put_hex8((uint8_t)(fsts >> 8)); usb_cdc_put_hex8((uint8_t)fsts);
+    usb_cdc_puts(" OUT="); usb_cdc_put_hex8((uint8_t)(outen >> 8)); usb_cdc_put_hex8((uint8_t)outen);
+    usb_cdc_puts(" MC="); usb_cdc_put_hex8((uint8_t)(mctrl >> 8)); usb_cdc_put_hex8((uint8_t)mctrl);
+    usb_cdc_puts(" C2="); usb_cdc_put_hex8((uint8_t)(c2 >> 8)); usb_cdc_put_hex8((uint8_t)c2);
+    usb_cdc_puts(" C="); usb_cdc_put_hex8((uint8_t)(c >> 8)); usb_cdc_put_hex8((uint8_t)c);
+    usb_cdc_puts(" D2="); usb_cdc_put_hex8((uint8_t)(dis2 >> 8)); usb_cdc_put_hex8((uint8_t)dis2);
+    usb_cdc_puts(" V1="); usb_cdc_put_u32(v1);
+    usb_cdc_puts(" V3="); usb_cdc_put_u32(v3);
+    usb_cdc_puts(" CNT="); usb_cdc_put_u32(cnt2);
+    usb_cdc_puts("\r\n");
+    usb_cdc_poll();
+}
+#endif
+
+static void haptics_set_motor(int is_right, uint8_t pct) {
+    uint32_t sm = is_right ? 3u : 2u;
+    uint32_t en_bit = 1u << (is_right ? 17u : 16u);
+    uint32_t sb = PWM4_BASE + (sm * 0x60u);
+    if (pct == 0u) {
+        REG16(sb + 0x12u) = 0u;
+        REG16(sb + 0x16u) = 0u;
+        REG16(PWM4_BASE + 0x188u) |= (uint16_t)(1u << sm);              /* LDOK */
+        GPIO_DR(GPIO2_BASE) |= en_bit;                                  /* Active-LOW OFF */
+        REG16(PWM4_BASE + 0x188u) &= (uint16_t)~(1u << (8u + sm));      /* Stop RUN */
+    } else {
+        if (pct > 100u) pct = 100u;
+        /* Map non-zero intensity 1..100% -> 25..95% ERM duty so motor overcomes stiction */
+        uint32_t duty = 25u + (((uint32_t)pct * 70u) / 100u);
+        if (duty > 95u) duty = 95u;
+        uint16_t val3 = (uint16_t)((duty * (uint32_t)PWM4_PERIOD_VAL1) / 100u);
+        if (val3 == 0u) val3 = 1u;
+        if (val3 >= PWM4_PERIOD_VAL1) val3 = (uint16_t)(PWM4_PERIOD_VAL1 - 1u);
+        REG16(sb + 0x0Eu) = PWM4_PERIOD_VAL1;
+        REG16(sb + 0x12u) = 0u;
+        REG16(sb + 0x16u) = val3;
+        REG16(PWM4_BASE + 0x188u) |= (uint16_t)(1u << sm);              /* LDOK first */
+        GPIO_DR(GPIO2_BASE) &= ~en_bit;                                 /* Active-LOW ON */
+        REG16(PWM4_BASE + 0x188u) |= (uint16_t)(1u << (8u + sm));       /* Start RUN */
+    }
+}
+
+static void haptics_stop_all(void) {
+    haptics_set_motor(0, 0u);
+    haptics_set_motor(1, 0u);
+    g_rumble_l = 0u;
+    g_rumble_r = 0u;
+    g_rumble_wdog = 0u;
+}
+
+void bt_set_rumble(uint8_t left_pct, uint8_t right_pct) {
+    int changed = (left_pct != g_rumble_l) || (right_pct != g_rumble_r);
+    g_rumble_l = left_pct;
+    g_rumble_r = right_pct;
+    haptics_set_motor(0, left_pct);
+    haptics_set_motor(1, right_pct);
+    g_rumble_wdog = (left_pct || right_pct) ? 18000u : 0u; /* ~1.5 s safety watchdog @ ~12k ticks/s */
+    if (changed && g_usb_cfg && g_usb_dtr) {
+        uint16_t fsts = REG16(PWM4_BASE + 0x18Eu);
+        uint16_t mctrl = REG16(PWM4_BASE + 0x188u);
+        usb_cdc_puts("RUMBLE L="); usb_cdc_put_u32(left_pct);
+        usb_cdc_puts(" R="); usb_cdc_put_u32(right_pct);
+        usb_cdc_puts(" FSTS="); usb_cdc_put_hex8((uint8_t)(fsts & 0xFFu));
+        usb_cdc_puts(" MC="); usb_cdc_put_hex8((uint8_t)(mctrl >> 8));
+        usb_cdc_puts("\r\n");
+    }
+}
+
+/* Battery Fuel Gauge (BQ2742X @ LPI2C1 0x55) + Charger (BQ25601 @ LPI2C1 0x6B) */
+static uint16_t g_bat_soc = 0xFFFFu;
+static uint16_t g_bat_mv = 0u;
+static uint8_t g_chg_reg08 = 0xFFu;
+
+static void bq2742x_wake_pulse(void) {
+    /* GPIO2_28 (GPIO_B1_12) is BQ2742X GPOUT (slot_a_bruce.bin @ 0x60068a00):
+     * drive HIGH -> LOW (~2 ms) -> HIGH (~2 ms) -> release Hi-Z input. */
+    IOMUXC_GPR_GPR(1) &= ~(1u << 28);
+    REG32(0x401F81ACu) = 5u;
+    REG32(0x401F839Cu) = 0x10B0u;
+    GPIO_DR(GPIO2_BASE) |= (1u << 28);
+    GPIO_GDIR(GPIO2_BASE) |= (1u << 28);
+    delay_cycles(200000u);
+    GPIO_DR(GPIO2_BASE) &= ~(1u << 28);
+    delay_cycles(200000u);
+    GPIO_DR(GPIO2_BASE) |= (1u << 28);
+    delay_cycles(200000u);
+    GPIO_GDIR(GPIO2_BASE) &= ~(1u << 28);
+}
+
+static void lpuart3_drain_rx(void);
+
+static void battery_poll_and_update(int log_now) {
+    uint16_t soc = 0xFFFFu;
+    uint16_t mv = 0u;
+    uint8_t reg08 = 0xFFu;
+    int soc_ok = (lpi2c_read_u16_le(LPI2C1_BASE, 0x55u, 0x1Cu, &soc) == 0 && soc <= 100u);
+    lpuart3_drain_rx();
+    delay_cycles(20000u); /* Respect BQ2742X t_BUF >= 66 us between commands */
+    int mv_ok = (lpi2c_read_u16_le(LPI2C1_BASE, 0x55u, 0x04u, &mv) == 0 && mv >= 2500u && mv <= 5000u);
+    lpuart3_drain_rx();
+    delay_cycles(20000u);
+    int chg_ok = (lpi2c_read_reg(LPI2C1_BASE, 0x6Bu, 0x08u, &reg08) == 0);
+    lpuart3_drain_rx();
+
+    if (soc_ok) g_bat_soc = soc;
+    if (mv_ok) g_bat_mv = mv;
+    if (chg_ok) g_chg_reg08 = reg08;
+
+    uint8_t level_nibble = 0x80u; /* Full default */
+    if (soc_ok) {
+        if (soc >= 75u) level_nibble = 0x80u;
+        else if (soc >= 50u) level_nibble = 0x60u;
+        else if (soc >= 25u) level_nibble = 0x40u;
+        else if (soc >= 10u) level_nibble = 0x20u;
+        else level_nibble = 0x00u;
+    } else if (mv_ok) {
+        if (mv >= 4000u) level_nibble = 0x80u;
+        else if (mv >= 3800u) level_nibble = 0x60u;
+        else if (mv >= 3650u) level_nibble = 0x40u;
+        else if (mv >= 3500u) level_nibble = 0x20u;
+        else level_nibble = 0x00u;
+    }
+
+    uint8_t chg_bit = 0x00u;
+    if (chg_ok) {
+        uint8_t chrg_stat = (uint8_t)((reg08 >> 3) & 0x03u);
+        uint8_t pg_stat = (uint8_t)((reg08 >> 2) & 0x01u);
+        if (chrg_stat == 1u || chrg_stat == 2u || (pg_stat && soc_ok && soc >= 95u)) {
+            chg_bit = 0x10u;
+        }
+    } else if (!soc_ok && !mv_ok) {
+        chg_bit = 0x10u; /* Fallback 0x90 when neither gauge nor charger responds */
+    }
+    g_bt.battery_byte = (uint8_t)(level_nibble | chg_bit);
+
+    if (log_now && g_usb_cfg && g_usb_dtr) {
+        usb_cdc_puts("BAT soc=");
+        if (soc_ok) usb_cdc_put_u32(soc); else usb_cdc_puts("--");
+        usb_cdc_puts("% mv=");
+        if (mv_ok) usb_cdc_put_u32(mv); else usb_cdc_puts("--");
+        usb_cdc_puts(" chg08=");
+        if (chg_ok) usb_cdc_put_hex8(reg08); else usb_cdc_puts("--");
+        usb_cdc_puts(" hid=0x"); usb_cdc_put_hex8(g_bt.battery_byte);
+        usb_cdc_puts("\r\n");
+    }
+}
+
 
 static uint8_t g_rx_ring[512];
 static volatile uint32_t g_rx_head = 0u;
@@ -549,19 +841,17 @@ typedef struct {
     uint32_t mux_reg;
 } probe_pin_t;
 
-/* GPIO2_10 excluded: active-LOW Hall trigger power enable initialized at boot */
-static const probe_pin_t k_probe_pins[14] = {
+/* Excluded from sweep: GPIO2_10 (L2/R2 Hall EN), GPIO2_28 (BQ2742X GPOUT), GPIO4_03 (PMIC_KILL companion) */
+static const probe_pin_t k_probe_pins[12] = {
     { "GPIO1_01", 0u,  1u, 0x401F80C0u },
     { "GPIO1_03", 0u,  3u, 0x401F80C8u },
     { "GPIO1_14", 0u, 14u, 0x401F80F4u },
     { "GPIO2_06", 1u,  6u, 0x401F8154u },
     { "GPIO2_07", 1u,  7u, 0x401F8158u },
     { "GPIO2_24", 1u, 24u, 0x401F819Cu },
-    { "GPIO2_28", 1u, 28u, 0x401F81ACu },
     { "GPIO3_21", 2u, 21u, 0x401F80A0u },
     { "GPIO3_23", 2u, 23u, 0x401F80A8u },
     { "GPIO3_26", 2u, 26u, 0x401F80B4u },
-    { "GPIO4_03", 3u,  3u, 0x401F8020u },
     { "GPIO4_27", 3u, 27u, 0x401F8080u },
     { "GPIO4_28", 3u, 28u, 0x401F8084u },
     { "GPIO4_29", 3u, 29u, 0x401F8088u },
@@ -599,17 +889,6 @@ static void probe_print_adc(const char *tag, const char *name, int level) {
     usb_cdc_puts(" LX="); usb_cdc_put_u32(lx);
     usb_cdc_puts("\r\n");
     usb_cdc_poll();
-}
-
-static void i2c_ensure_bus(uint32_t idx) {
-    const lpi2c_pins_t *p = &k_i2c_candidates[idx];
-    REG32(p->mux_scl) = p->mux_val;
-    REG32(p->mux_sda) = p->mux_val;
-    REG32(p->pad_scl) = 0x18B0u;
-    REG32(p->pad_sda) = 0x18B0u;
-    REG32(p->sel_scl) = p->sel_val;
-    REG32(p->sel_sda) = p->sel_val;
-    lpi2c_init(p->base);
 }
 
 static void i2c_dump_chip(uint32_t bus_num, uint32_t base, uint8_t addr7) {
@@ -714,6 +993,30 @@ static void handle_w_cmd(const char *line) {
     usb_cdc_puts("\r\n");
 }
 
+static int parse_dec_tok(const char **p, uint32_t *out) {
+    const char *s = *p;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s < '0' || *s > '9') return -1;
+    uint32_t v = 0u;
+    while (*s >= '0' && *s <= '9') {
+        v = (v * 10u) + (uint32_t)(*s - '0');
+        s++;
+    }
+    *p = s;
+    *out = v;
+    return 0;
+}
+
+static void handle_m_cmd(const char *line) {
+    const char *p = line + 1;
+    uint32_t lv = 0u, rv = 0u;
+    if (parse_dec_tok(&p, &lv) < 0 || parse_dec_tok(&p, &rv) < 0 || lv > 100u || rv > 100u) {
+        usb_cdc_puts("M ERR usage: m <L 0..100> <R 0..100>\r\n");
+        return;
+    }
+    bt_set_rumble((uint8_t)lv, (uint8_t)rv);
+}
+
 static void hall_probe_poll(void) {
     static char cmd_buf[48];
     static uint32_t cmd_len = 0u;
@@ -727,21 +1030,30 @@ static void hall_probe_poll(void) {
                 cmd_len = 0u;
                 if (cmd_buf[0] == 'w') {
                     handle_w_cmd(cmd_buf);
+                } else if (cmd_buf[0] == 'm') {
+                    handle_m_cmd(cmd_buf);
                 }
             } else if (cmd_len + 1u < sizeof(cmd_buf)) {
                 cmd_buf[cmd_len++] = (char)ch;
             }
             continue;
         }
-        if (ch == 'w') {
-            cmd_buf[0] = 'w';
+        if (ch == 'w' || ch == 'm') {
+            cmd_buf[0] = (char)ch;
             cmd_len = 1u;
             in_line = 1;
+        } else if (ch == 'b') {
+            bq2742x_wake_pulse();
+            delay_cycles(500000u);
+            i2c_ensure_bus(0u);
+            battery_poll_and_update(1);
+        } else if (ch == 'p') {
+            haptics_print_regs("PWM REGS:");
         } else if (ch == 'i') {
             i2c_scan_and_dump();
         } else if (ch == 's') {
             usb_cdc_puts("SWEEP START\r\n");
-            for (uint32_t i = 0u; i < 14u; ++i) {
+            for (uint32_t i = 0u; i < 12u; ++i) {
                 for (int lvl = 1; lvl >= 0; --lvl) {
                     probe_drive_pin(i, lvl);
                     for (uint32_t w = 0u; w < 100u; ++w) {
@@ -755,16 +1067,16 @@ static void hall_probe_poll(void) {
             }
             usb_cdc_puts("SWEEP DONE\r\n");
         } else if (ch == 'r') {
-            for (uint32_t i = 0u; i < 14u; ++i) {
+            for (uint32_t i = 0u; i < 12u; ++i) {
                 probe_release_pin(i);
             }
             probe_print_adc("PROBE", "ALL", -1);
-        } else if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'd')) {
+        } else if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'b')) {
             uint32_t idx = (ch >= 'a') ? (10u + (uint32_t)(ch - 'a')) : (uint32_t)(ch - '0');
             probe_drive_pin(idx, 1);
             delay_cycles(500000u);
             probe_print_adc("PROBE", k_probe_pins[idx].name, 1);
-        } else if (ch >= 'A' && ch <= 'N') {
+        } else if (ch >= 'A' && ch <= 'L') {
             uint32_t idx = (uint32_t)(ch - 'A');
             probe_drive_pin(idx, 0);
             delay_cycles(500000u);
@@ -963,6 +1275,18 @@ static void log_hci_pkt(const char *tag, const uint8_t *buf, uint32_t len) {
     if (!g_usb_cfg || !g_usb_dtr) {
         return;
     }
+    /* Redact 16-byte Link Key payload in HCI_Link_Key_Notification (0x18) */
+    if (tag[0] == 'H' && len >= 25u && buf[0] == 0x18u) {
+        usb_cdc_puts(tag);
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            usb_cdc_puts(" ");
+            usb_cdc_put_hex8(buf[i]);
+        }
+        usb_cdc_puts(" [KEY-REDACTED] ");
+        usb_cdc_put_hex8(buf[24]);
+        usb_cdc_puts("\r\n");
+        return;
+    }
     usb_cdc_puts(tag);
     uint32_t n = (len > 32u) ? 32u : len;
     for (uint32_t i = 0u; i < n; ++i) {
@@ -973,6 +1297,79 @@ static void log_hci_pkt(const char *tag, const uint8_t *buf, uint32_t len) {
         usb_cdc_puts(" ...");
     }
     usb_cdc_puts("\r\n");
+}
+
+/* RAM-only Link Key cache (up to 4 peers per boot session) */
+typedef struct {
+    uint8_t valid;
+    uint8_t bd_addr[6];
+    uint8_t link_key[16];
+} bt_link_key_t;
+
+static bt_link_key_t g_link_keys[4];
+static uint8_t g_link_key_next = 0u;
+
+static int bd_addr_eq(const uint8_t a[6], const uint8_t b[6]) {
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+static void bt_link_key_save(const uint8_t bd[6], const uint8_t key[16]) {
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (g_link_keys[i].valid && bd_addr_eq(g_link_keys[i].bd_addr, bd)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < 4; ++i) {
+            if (!g_link_keys[i].valid) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        slot = (int)(g_link_key_next & 3u);
+        g_link_key_next++;
+    }
+    g_link_keys[slot].valid = 1u;
+    for (uint32_t i = 0u; i < 6u; ++i) g_link_keys[slot].bd_addr[i] = bd[i];
+    for (uint32_t i = 0u; i < 16u; ++i) g_link_keys[slot].link_key[i] = key[i];
+    if (g_usb_cfg && g_usb_dtr) {
+        usb_cdc_puts("BT LINK KEY CACHED slot=");
+        usb_cdc_put_u32((uint32_t)slot);
+        usb_cdc_puts("\r\n");
+    }
+}
+
+static int bt_link_key_find(const uint8_t bd[6], uint8_t key_out[16]) {
+    for (int i = 0; i < 4; ++i) {
+        if (g_link_keys[i].valid && bd_addr_eq(g_link_keys[i].bd_addr, bd)) {
+            for (uint32_t j = 0u; j < 16u; ++j) key_out[j] = g_link_keys[i].link_key[j];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void bt_link_key_clear_peer(const uint8_t bd[6]) {
+    for (int i = 0; i < 4; ++i) {
+        if (g_link_keys[i].valid && bd_addr_eq(g_link_keys[i].bd_addr, bd)) {
+            g_link_keys[i].valid = 0u;
+            for (uint32_t j = 0u; j < 16u; ++j) g_link_keys[i].link_key[j] = 0u;
+        }
+    }
+}
+
+static void bt_link_key_clear_all(void) {
+    for (int i = 0; i < 4; ++i) {
+        g_link_keys[i].valid = 0u;
+        for (uint32_t j = 0u; j < 16u; ++j) g_link_keys[i].link_key[j] = 0u;
+    }
 }
 
 void bt_log_acl_tx(uint16_t cid, const uint8_t *payload, uint16_t plen) {
@@ -1018,14 +1415,40 @@ static void bt_handle_hci_event(const uint8_t *buf, uint32_t len) {
         /* HCI_Connection_Complete */
         if (buf[2] == 0x00u) {
             g_bt.acl_handle = (uint16_t)buf[3] | ((uint16_t)(buf[4] & 0x0Fu) << 8);
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                g_bt.peer_bd_addr[i] = buf[5u + i];
+            }
             g_bt.connected = 1u;
         }
     } else if (evt == 0x05u && len >= 6u) {
-        /* HCI_Disconnection_Complete */
+        /* HCI_Disconnection_Complete: stop motors, reset state, re-enable scan */
+        haptics_stop_all();
         bt_hid_init_state(g_bt.bd_addr);
+        uint8_t scan_both = 0x03u;
+        hci_send_cmd_nb(0x0C1Au, &scan_both, 1u);
+    } else if (evt == 0x06u && len >= 5u) {
+        /* HCI_Authentication_Complete: evict stale cached key if auth failed */
+        if (buf[2] != 0x00u && g_bt.connected) {
+            bt_link_key_clear_peer(g_bt.peer_bd_addr);
+            if (g_usb_cfg && g_usb_dtr) {
+                usb_cdc_puts("BT AUTH FAIL -> EVICTED LINK KEY\r\n");
+            }
+        }
     } else if (evt == 0x17u && len >= 8u) {
-        /* HCI_Link_Key_Request -> Negative Reply */
-        hci_send_cmd_nb(0x040Cu, &buf[2], 6u);
+        /* HCI_Link_Key_Request -> Reply from RAM cache if present, else Negative Reply */
+        uint8_t p[22];
+        if (bt_link_key_find(&buf[2], &p[6])) {
+            for (uint32_t i = 0u; i < 6u; ++i) p[i] = buf[2u + i];
+            hci_send_cmd_nb(0x040Bu, p, 22u);
+            if (g_usb_cfg && g_usb_dtr) {
+                usb_cdc_puts("BT LINK KEY HIT -> FAST RECONNECT\r\n");
+            }
+        } else {
+            hci_send_cmd_nb(0x040Cu, &buf[2], 6u);
+        }
+    } else if (evt == 0x18u && len >= 25u) {
+        /* HCI_Link_Key_Notification -> Cache in RAM for same-session reconnect */
+        bt_link_key_save(&buf[2], &buf[8]);
     } else if (evt == 0x16u && len >= 8u) {
         /* HCI_PIN_Code_Request -> Reply "0000" */
         uint8_t p[23];
@@ -1097,7 +1520,16 @@ static void bt_poll_uart(const pro_input_t *in) {
                 if (rx_type == 0x04u) {
                     bt_handle_hci_event(rx_buf, rx_pos);
                 } else if (rx_type == 0x02u) {
-                    log_hci_pkt("ACL RX:", rx_buf, rx_pos);
+                    /* Skip flooding CDC with neutral Switch A2 10 keepalive frames */
+                    int is_neutral_rumble = (rx_pos == 19u && rx_buf[6] == 0x42u && rx_buf[7] == 0x00u &&
+                                             rx_buf[8] == 0xA2u && rx_buf[9] == 0x10u &&
+                                             rx_buf[11] == 0x00u && rx_buf[12] == 0x01u &&
+                                             rx_buf[13] == 0x40u && rx_buf[14] == 0x40u &&
+                                             rx_buf[15] == 0x00u && rx_buf[16] == 0x01u &&
+                                             rx_buf[17] == 0x40u && rx_buf[18] == 0x40u);
+                    if (!is_neutral_rumble) {
+                        log_hci_pkt("ACL RX:", rx_buf, rx_pos);
+                    }
                     bt_handle_acl(rx_buf, rx_pos, in);
                 }
             }
@@ -1116,6 +1548,46 @@ static void lp5562_set_rgbw(uint32_t base, uint8_t addr,
     lpi2c_write_reg(base, addr, 0x03u, g);
     lpi2c_write_reg(base, addr, 0x04u, r);
     lpi2c_write_reg(base, addr, 0x0Eu, w);
+}
+
+static void stadia_power_off(int has_bt, int has_led, uint32_t i2c_base, uint8_t lp_addr) {
+    haptics_stop_all();
+    if (has_bt && g_bt.connected) {
+        uint8_t disc[3] = {
+            (uint8_t)(g_bt.acl_handle & 0xFFu),
+            (uint8_t)((g_bt.acl_handle >> 8) & 0x0Fu),
+            0x13u /* Remote User Terminated Connection */
+        };
+        hci_send_cmd_nb(0x0406u, disc, 3u);
+    }
+    if (g_usb_cfg && g_usb_dtr) {
+        usb_cdc_puts("POWER OFF (PMIC_KILL)\r\n");
+    }
+    if (has_led) {
+        lp5562_set_rgbw(i2c_base, lp_addr, 0xFFu, 0x00u, 0x00u, 0x00u);
+    }
+    for (uint32_t w = 0u; w < 80u; ++w) {
+        usb_cdc_poll();
+        delay_cycles(200000u);
+    }
+    if (has_led) {
+        lp5562_set_rgbw(i2c_base, lp_addr, 0x00u, 0x00u, 0x00u, 0x00u);
+    }
+    /* Stock PMIC_KILL sequence (slot_a_bruce.bin @ 0x600510c0):
+     * drive GPIO4_03 (GPIO_EMC_03) LOW, then GPIO4_02 (GPIO_EMC_02, PMIC_KILL) HIGH. */
+    IOMUXC_GPR_GPR(3) &= ~((1u << 2) | (1u << 3));
+    REG32(0x401F8020u) = 5u;      /* GPIO_EMC_03 -> GPIO4_03 */
+    REG32(0x401F8210u) = 0x10B0u;
+    REG32(0x401F801Cu) = 5u;      /* GPIO_EMC_02 -> GPIO4_02 (PMIC_KILL) */
+    REG32(0x401F820Cu) = 0x10B0u;
+    GPIO_DR(GPIO4_BASE) &= ~(1u << 3);
+    GPIO_GDIR(GPIO4_BASE) |= (1u << 3);
+    delay_cycles(50000u);
+    GPIO_DR(GPIO4_BASE) |= (1u << 2);
+    GPIO_GDIR(GPIO4_BASE) |= (1u << 2);
+    while (1) {
+        __asm__ volatile ("nop");
+    }
 }
 
 static void disable_watchdogs(void) {
@@ -1137,21 +1609,24 @@ void Reset_Handler(void) {
 
     disable_watchdogs();
 
-    /* Enable peripheral clocks: LPUART3, ADC1, GPIO1-4, IOMUXC, and LPI2C1-4 */
+    /* Enable peripheral clocks: LPUART3, ADC1, GPIO1-4, IOMUXC, XBARA1, FlexPWM4, and LPI2C1-4 */
     CCM_CCGR0 |= (3u << 12);
     CCM_CCGR1 |= (3u << 16) | (3u << 26) | (3u << 28) | (3u << 30);
     CCM_CCGR2 |= (3u << 6)  | (3u << 8) | (3u << 10) | (3u << 26);
     CCM_CCGR3 |= (3u << 12);
-    CCM_CCGR4 |= (3u << 2);
+    CCM_CCGR4 |= (3u << 2)  | (3u << 22); /* IOMUXC + PWM4 */
     CCM_CCGR6 |= (3u << 24);
+    __asm__ volatile ("dsb sy");
 
     DIAG_STATUS->magic      = 0x53544144u; /* "STAD" */
-    DIAG_STATUS->version    = 5u;
+    DIAG_STATUS->version    = 6u;
     DIAG_STATUS->digprog    = REG32(0x400D8260u);
     DIAG_STATUS->ocotp_cfg5 = REG32(0x401F4460u);
     DIAG_STATUS->ticks      = 0u;
 
+    haptics_gpio_safe_off();
     usb_cdc_init();
+    bq2742x_wake_pulse(); /* Wake BQ2742X before BT HCD download covers ~500 ms settle time */
 
     uint32_t idle_psr[4] = { 0 };
     configure_button_gpios(idle_psr);
@@ -1164,6 +1639,12 @@ void Reset_Handler(void) {
     uint16_t idle_sticks[6] = { 0 };
     adc1_init_sticks(idle_sticks);
 
+    haptics_pwm_init();
+
+    /* Ensure LPI2C1 is ready (without touching LPI2C3/sticks) and take initial battery reading */
+    i2c_ensure_bus(0u);
+    battery_poll_and_update(0);
+
     pro_input_t in = { 0, 0, 0, 2048u, 2048u, 2048u, 2048u };
     uint16_t stick_val[6] = {
         idle_sticks[0], idle_sticks[1], idle_sticks[2],
@@ -1171,6 +1652,9 @@ void Reset_Handler(void) {
     };
     uint32_t last_led_state = 0xFFu;
     uint8_t printed_banner = 0u;
+    uint32_t repair_hold = 0u;
+    uint8_t repair_fired = 0u;
+    uint32_t poweroff_hold = 0u;
 
     while (1) {
         usb_cdc_poll();
@@ -1179,6 +1663,23 @@ void Reset_Handler(void) {
             bt_poll_uart(&in);
         }
         DIAG_STATUS->ticks += 1u;
+
+        /* Haptics safety watchdog: auto-stop motors if host stops updating (~1.5 s) */
+        if (g_rumble_wdog > 0u) {
+            g_rumble_wdog--;
+            if (g_rumble_wdog == 0u) {
+                haptics_stop_all();
+                if (g_usb_cfg && g_usb_dtr) {
+                    usb_cdc_puts("RUMBLE WDOG STOP\r\n");
+                }
+            }
+        }
+
+        /* Periodic battery poll (~5.5 s interval @ ~12k ticks/s) */
+        if ((DIAG_STATUS->ticks & 65535u) == 0u) {
+            battery_poll_and_update(1);
+        }
+
         if (g_usb_cfg && g_usb_dtr && !printed_banner) {
             printed_banner = 1u;
             usb_cdc_puts("\r\n=== STADIA DTCM CONSOLE READY ===\r\n");
@@ -1190,6 +1691,7 @@ void Reset_Handler(void) {
                 if (i > 0) usb_cdc_puts(":");
             }
             usb_cdc_puts("\r\n");
+            battery_poll_and_update(1);
         }
         if (!g_usb_dtr) {
             printed_banner = 0u;
@@ -1213,6 +1715,58 @@ void Reset_Handler(void) {
         uint32_t act2 = (idle_psr[1] & ~p2) & BTN_MASK_GPIO2;
         uint32_t act3 = (idle_psr[2] & ~p3) & BTN_MASK_GPIO3;
         uint32_t act4 = (idle_psr[3] & ~p4) & BTN_MASK_GPIO4;
+
+        /* Assistant (GPIO2_14) hold ~1.0 s -> disconnect & clear peer Link Key for re-pairing;
+         * Stadia (GPIO2_11) + Assistant (GPIO2_14) hold ~2.5 s -> clean PMIC_KILL power-off. */
+        int stadia_held = (act2 & (1u << 11)) != 0u;
+        int asst_held = (act2 & (1u << 14)) != 0u;
+        if (asst_held && stadia_held) {
+            repair_hold = 0u;
+            poweroff_hold++;
+            if (poweroff_hold >= 30000u) {
+                stadia_power_off(has_bt, has_led, i2c_base, lp_addr);
+            }
+        } else if (asst_held) {
+            poweroff_hold = 0u;
+            if (!repair_fired) {
+                repair_hold++;
+                if (repair_hold >= 12000u) {
+                    repair_fired = 1u;
+                    haptics_stop_all();
+                    if (g_usb_cfg && g_usb_dtr) {
+                        usb_cdc_puts("BT RE-PAIR (Assistant)\r\n");
+                    }
+                    if (has_bt) {
+                        if (g_bt.connected) {
+                            bt_link_key_clear_peer(g_bt.peer_bd_addr);
+                            uint8_t disc[3] = {
+                                (uint8_t)(g_bt.acl_handle & 0xFFu),
+                                (uint8_t)((g_bt.acl_handle >> 8) & 0x0Fu),
+                                0x13u
+                            };
+                            hci_send_cmd_nb(0x0406u, disc, 3u);
+                        } else {
+                            bt_link_key_clear_all();
+                        }
+                        uint8_t scan_both = 0x03u;
+                        hci_send_cmd_nb(0x0C1Au, &scan_both, 1u);
+                    }
+                    if (has_led) {
+                        lp5562_set_rgbw(i2c_base, lp_addr, 0x00u, 0xFFu, 0x00u, 0x00u);
+                        for (uint32_t w = 0u; w < 40u; ++w) {
+                            lpuart3_drain_rx();
+                            usb_cdc_poll();
+                            delay_cycles(100000u);
+                        }
+                        last_led_state = 0xFFu;
+                    }
+                }
+            }
+        } else {
+            repair_hold = 0u;
+            repair_fired = 0u;
+            poweroff_hold = 0u;
+        }
 
         /* Sample one analog channel per loop to keep UART/USB polling fast */
         uint32_t ch_idx = DIAG_STATUS->ticks % 6u;
@@ -1254,7 +1808,7 @@ void Reset_Handler(void) {
         if (act2 & (1u << 12)) in.btn_shared |= (1u << 1); /* Plus (Options) */
         if (act1 & (1u << 2))  in.btn_shared |= (1u << 2); /* R3 */
         if (act1 & (1u << 0))  in.btn_shared |= (1u << 3); /* L3 */
-        if (act2 & (1u << 11)) in.btn_shared |= (1u << 4); /* Home (Stadia) */
+        if (act2 & (1u << 11) && !asst_held) in.btn_shared |= (1u << 4); /* Home (Stadia) */
         if (act2 & (1u << 15)) in.btn_shared |= (1u << 5); /* Capture */
 
         in.btn_left = 0u;

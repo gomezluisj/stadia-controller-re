@@ -10,9 +10,9 @@ Hardware pinout, NOR partition layout, BootROM/HABv4 security analysis, bare-met
 
 | Area | Status | Reference |
 |---|---|---|
-| **Hardware pinout** (`ADC1` sticks & triggers, 17 buttons, `LP5562`, `LPI2C1`, `BCM43458F`) | **Hardware-verified** (including active-LOW `GPIO2_10 = 0` for `L2`/`R2` Hall triggers) | [docs/hardware-pinout.md](docs/hardware-pinout.md) |
+| **Hardware pinout** (`ADC1` sticks & triggers, 17 buttons, `LP5562`, all 4 `LPI2C1` ICs, `FlexPWM4` haptics, `PMIC_KILL`, `SAI1`, `BCM43458F`) | **Hardware-verified** (all 5/5 I2C chips, `GPIO2_10 = 0` Hall triggers, 30 kHz `FlexPWM4` + `XBARA1` motors, `GPIO4_02/03` power-off) | [docs/hardware-pinout.md](docs/hardware-pinout.md) |
 | **NOR layout (16 MiB), Boot chain & HABv4** | **Mapped & verified** (all 4,096 sectors, `FCB`, `IVT`, `CSF`, `BEE Region 1`) | [docs/boot-and-nor.md](docs/boot-and-nor.md) |
-| **Bare-metal execution (`ROMC` DTCM/OCRAM)** | **Working** (USB CDC-ACM on OCRAM `0x20200000`, all inputs + `L2`/`R2`, Classic BT HID `Pro Controller` verified on **macOS** & **Nintendo Switch 2**) | [docs/bare-metal-bringup.md](docs/bare-metal-bringup.md) |
+| **Bare-metal execution (`ROMC` DTCM/OCRAM)** | **Working** (`tools/boot_dtcm.py` one-command loader, USB CDC-ACM, all inputs + `L2`/`R2`, BT HD rumble, real battery %, RAM `Link Key` cache, `Assistant` re-pair, `PMIC_KILL` power-off; Classic BT HID `Pro Controller` verified on **macOS** & **Nintendo Switch 2**) | [docs/bare-metal-bringup.md](docs/bare-metal-bringup.md) |
 | **Security audit (`bruce` & `gotham`)** | **Completed** (USB vendor RPC, EP0, BLE GATT, KVS, BootROM HAB) | [docs/security-audit.md](docs/security-audit.md) |
 | **KVS record format & BEE Region 1 spec** | **Documented + parser** | [docs/kvs-parser-spec.md](docs/kvs-parser-spec.md) |
 
@@ -33,6 +33,7 @@ Hardware pinout, NOR partition layout, BootROM/HABv4 security analysis, bare-met
 Run the built-in self-tests (requires Python 3, no hardware needed):
 
 ```bash
+python3 tools/boot_dtcm.py --selftest
 python3 tools/extract_hcd.py --selftest
 python3 tools/ivt_csf_inspect.py --selftest
 python3 tools/kvs_parse.py --selftest
@@ -45,7 +46,8 @@ python3 tools/stadia_diag.py --selftest
 | Path | Description |
 |---|---|
 | `docs/` | Modular technical reference (`hardware-pinout.md`, `boot-and-nor.md`, `bare-metal-bringup.md`, `security-audit.md`, `kvs-parser-spec.md`) |
-| `firmware/stadia-ram-hello/` | Bare-metal Cortex-M7 DTCM firmware (Switch Pro Controller over Classic BT HID + USB CDC-ACM console; excludes proprietary `.hcd` blob) |
+| `firmware/stadia-ram-hello/` | Bare-metal Cortex-M7 DTCM firmware (Switch Pro Controller over Classic BT HID with HD rumble, real battery %, RAM `Link Key` cache, `Assistant` re-pair, `PMIC_KILL` power-off & USB CDC-ACM console; excludes proprietary `.hcd` blob) |
+| `tools/boot_dtcm.py` | One-command DTCM bootloader: checks SDP HAB (`1fc9:0135`), runs `nxp-sdp-overrun` if Closed, uploads & jumps to `0x20000400`, optional `--console` |
 | `tools/extract_hcd.py` | Extracts `BCM43458F` `.hcd` `patchram` (`53,450 B`, 228 HCI packets) from a local `slot_a_bruce.bin` dump into `bcm43458f_hcd.h` |
 | `tools/kvs_parse.py` | Parser for NOR KVS partitions (`id=9`, `id=5`, `id=4`; supports `g={1,2,4,8,16}` and BEE AES-128-ECB classification) |
 | `tools/nor_slice_inspect.py` | Offline partition carver & inspector for raw NOR dumps (low 256 KiB, slots, or full 16 MiB) with PII redaction |
@@ -53,7 +55,7 @@ python3 tools/stadia_diag.py --selftest
 | `tools/stadia_diag.py` | Read-only USB HID / EP0 diagnostic tool querying safe vendor IN descriptors (`0x81`, `0x84`, `0x87`–`0x8a`, `0x8c`) |
 | `tools/udev/99-stadia-controller.rules` | Linux udev rules for App (`18d1:9400`), Bootloader (`18d1:946b`), SDP (`1fc9:0135`), and Flashloader (`15a2:0073`) |
 | `ghidra/` | Headless Ghidra scripts (`DecompAll.java`, `DecompForce.java`, `Xrefs.java`, `MapScatterLoad.java`) |
-| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI/BLE logs, and live USB CDC-ACM captures (`cdc_i2c_scan.log`, `cdc_l2r2_gpio2_10.log`, `cdc_bt_sdp_hid.log`, `cdc_switch2_bt_hid.log`) |
+| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI/BLE logs, and live USB CDC-ACM captures (`cdc_i2c_scan.log`, `cdc_l2r2_gpio2_10.log`, `cdc_bt_sdp_hid.log`, `cdc_switch2_bt_hid.log`, `cdc_haptics_battery_linkkey.log`) |
 
 ---
 

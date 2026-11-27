@@ -4,6 +4,7 @@
 /* Callbacks provided by main.c */
 void bt_uart_write(const uint8_t *data, uint32_t len);
 void bt_log_acl_tx(uint16_t cid, const uint8_t *payload, uint16_t plen);
+void bt_set_rumble(uint8_t left_pct, uint8_t right_pct);
 
 /* Live controller input state populated by main.c */
 typedef struct {
@@ -19,12 +20,15 @@ typedef struct {
 typedef struct {
     uint16_t acl_handle;
     uint8_t bd_addr[6];
+    uint8_t peer_bd_addr[6];
     uint8_t connected;
     uint8_t hid_ready;
     uint8_t report_mode; /* 0x3F default, 0x30 full */
     uint8_t timer;
     uint8_t player_leds;
     uint8_t acl_in_flight;
+    uint8_t battery_byte; /* Switch Pro pkt[3]: upper nibble level+chg, low nibble 0 */
+    uint8_t rumble_enabled;
 
     /* L2CAP channel tracking: 0=SDP(0x0001), 1=HID_CTRL(0x0011), 2=HID_INTR(0x0013) */
     uint16_t l2cap_host_cid[3];
@@ -43,9 +47,11 @@ static bt_hid_state_t g_bt;
 static uint8_t g_acl_reasm[700];
 
 static void bt_hid_init_state(const uint8_t bd_addr[6]) {
+    uint8_t keep_bat = g_bt.battery_byte ? g_bt.battery_byte : 0x90u;
     g_bt.acl_handle = 0u;
     for (uint32_t i = 0u; i < 6u; ++i) {
         g_bt.bd_addr[i] = bd_addr[i];
+        g_bt.peer_bd_addr[i] = 0u;
     }
     g_bt.connected = 0u;
     g_bt.hid_ready = 0u;
@@ -53,6 +59,8 @@ static void bt_hid_init_state(const uint8_t bd_addr[6]) {
     g_bt.timer = 0u;
     g_bt.player_leds = 0u;
     g_bt.acl_in_flight = 0u;
+    g_bt.battery_byte = keep_bat;
+    g_bt.rumble_enabled = 1u;
     for (uint32_t i = 0u; i < 3u; ++i) {
         g_bt.l2cap_host_cid[i] = 0u;
         g_bt.l2cap_open[i] = 0u;
@@ -496,7 +504,7 @@ static void hid_send_input_report(const pro_input_t *in) {
         pkt[0] = 0xA1u;
         pkt[1] = 0x30u;
         pkt[2] = g_bt.timer++;
-        pkt[3] = 0x90u; /* USB/Full battery + Switch-powered */
+        pkt[3] = g_bt.battery_byte;
         pkt[4] = in->btn_right;
         pkt[5] = in->btn_shared;
         pkt[6] = in->btn_left;
@@ -568,7 +576,7 @@ static void hid_send_subcmd_reply(uint8_t subcmd, uint8_t ack,
     pkt[0] = 0xA1u;
     pkt[1] = 0x21u;
     pkt[2] = g_bt.timer++;
-    pkt[3] = 0x90u;
+    pkt[3] = g_bt.battery_byte;
     pkt[4] = in->btn_right;
     pkt[5] = in->btn_shared;
     pkt[6] = in->btn_left;
@@ -582,13 +590,51 @@ static void hid_send_subcmd_reply(uint8_t subcmd, uint8_t ack,
     hci_send_acl(g_bt.l2cap_host_cid[2], pkt, 50u);
 }
 
+static uint8_t hid_decode_rumble_side(const uint8_t r[4]) {
+    /* Switch Pro HD rumble 4-byte block:
+     * Neutral is 00 01 40 40 (or 00 00 00 00).
+     * HF amplitude lives in (r[1] & 0xFE), range 0x00..0xC8.
+     * LF amplitude lives in ((r[3] & 0x7F) << 1) | ((r[2] >> 7) & 1), neutral 0x80..max ~0xE5. */
+    uint32_t hf_raw = (uint32_t)(r[1] & 0xFEu);
+    uint32_t lf_code = (((uint32_t)(r[3] & 0x7Fu)) << 1) | (((uint32_t)r[2] >> 7) & 1u);
+    uint32_t lf_raw = (lf_code > 0x80u) ? (lf_code - 0x80u) : 0u;
+    uint32_t hf_pct = (hf_raw * 100u) / 200u;
+    uint32_t lf_pct = lf_raw;
+    uint32_t pct = (hf_pct > lf_pct) ? hf_pct : lf_pct;
+    if (pct > 100u) {
+        pct = 100u;
+    }
+    return (uint8_t)pct;
+}
+
 static void hid_handle_output(const uint8_t *data, uint16_t len, const pro_input_t *in) {
-    if (len < 12u) {
+    if (len < 11u) {
         return;
     }
-    /* Output report: [0xA2 or 0x52, report_id, timer, rumble[8], subcmd, args...] */
+    /* Output report: [0xA2 or 0x52, report_id, timer, rumble[8], (subcmd, args...)] */
     uint8_t rpt_id = data[1];
+    if (rpt_id == 0x10u) {
+        uint8_t l = hid_decode_rumble_side(&data[3]);
+        uint8_t r = hid_decode_rumble_side(&data[7]);
+        bt_set_rumble(g_bt.rumble_enabled ? l : 0u, g_bt.rumble_enabled ? r : 0u);
+        return;
+    }
     if (rpt_id != 0x01u) {
+        return;
+    }
+    /* In 0x01 subcmd packets, Switch sends 8 zero bytes when not updating rumble;
+     * only apply rumble if at least one of the 8 rumble bytes is non-zero so
+     * interleaved subcmds (e.g. player LED 0x30) do not clip an active 0x10 buzz. */
+    uint8_t rumble_or = 0u;
+    for (uint32_t i = 3u; i < 11u; ++i) {
+        rumble_or |= data[i];
+    }
+    if (rumble_or != 0u) {
+        uint8_t l = hid_decode_rumble_side(&data[3]);
+        uint8_t r = hid_decode_rumble_side(&data[7]);
+        bt_set_rumble(g_bt.rumble_enabled ? l : 0u, g_bt.rumble_enabled ? r : 0u);
+    }
+    if (len < 12u) {
         return;
     }
     uint8_t subcmd = data[11];
@@ -663,8 +709,15 @@ static void hid_handle_output(const uint8_t *data, uint16_t len, const pro_input
     } else if (subcmd == 0x30u && alen >= 1u) {
         g_bt.player_leds = args[0];
         hid_send_subcmd_reply(subcmd, 0x80u, 0, 0u, in);
+    } else if (subcmd == 0x48u && alen >= 1u) {
+        /* Enable/disable vibration */
+        g_bt.rumble_enabled = (args[0] != 0u) ? 1u : 0u;
+        if (!g_bt.rumble_enabled) {
+            bt_set_rumble(0u, 0u);
+        }
+        hid_send_subcmd_reply(subcmd, 0x80u, 0, 0u, in);
     } else {
-        /* Generic ACK for 0x08, 0x21, 0x38, 0x40, 0x48, etc. */
+        /* Generic ACK for 0x08, 0x21, 0x38, 0x40, etc. */
         hid_send_subcmd_reply(subcmd, 0x80u, 0, 0u, in);
     }
 }
