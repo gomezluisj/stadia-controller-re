@@ -10,3 +10,4 @@ No copyrighted firmware binaries are hosted here — only hashes, console excerp
 | `cdc_i2c_scan.log` | Live `LPI2C1`/`LPI2C2` register dump (`0x1A` `WM8904`, `0x3B` `TS3A227E`, `0x30` `LP5562`) |
 | `cdc_l2r2_gpio2_10.log` | 15-GPIO sweep proving active-LOW `GPIO2_10 = 0` powers `L2`/`R2` Hall triggers (`IN8`/`IN13`) + full-press ranges |
 | `cdc_bt_sdp_hid.log` | Redacted Classic BT HCI/ACL trace of paginated SDP, SSP + encryption, and Switch Pro Controller HID bring-up on macOS |
+| `cdc_switch2_bt_hid.log` | Redacted Classic BT HCI/ACL trace of Nintendo Switch 2 pairing (`Auth=0x04`, Sniff Mode, L2CAP MTU echo, `L+R` `0x3F`, full Pro Controller init) |

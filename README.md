@@ -12,7 +12,7 @@ Hardware pinout, NOR partition layout, BootROM/HABv4 security analysis, bare-met
 |---|---|---|
 | **Hardware pinout** (`ADC1` sticks & triggers, 17 buttons, `LP5562`, `LPI2C1`, `BCM43458F`) | **Hardware-verified** (including active-LOW `GPIO2_10 = 0` for `L2`/`R2` Hall triggers) | [docs/hardware-pinout.md](docs/hardware-pinout.md) |
 | **NOR layout (16 MiB), Boot chain & HABv4** | **Mapped & verified** (all 4,096 sectors, `FCB`, `IVT`, `CSF`, `BEE Region 1`) | [docs/boot-and-nor.md](docs/boot-and-nor.md) |
-| **Bare-metal execution (`ROMC` DTCM/OCRAM)** | **Working** (USB CDC-ACM on OCRAM `0x20200000`, all inputs + `L2`/`R2`, Classic BT HID `Pro Controller` on macOS) | [docs/bare-metal-bringup.md](docs/bare-metal-bringup.md) |
+| **Bare-metal execution (`ROMC` DTCM/OCRAM)** | **Working** (USB CDC-ACM on OCRAM `0x20200000`, all inputs + `L2`/`R2`, Classic BT HID `Pro Controller` verified on **macOS** & **Nintendo Switch 2**) | [docs/bare-metal-bringup.md](docs/bare-metal-bringup.md) |
 | **Security audit (`bruce` & `gotham`)** | **Completed** (USB vendor RPC, EP0, BLE GATT, KVS, BootROM HAB) | [docs/security-audit.md](docs/security-audit.md) |
 | **KVS record format & BEE Region 1 spec** | **Documented + parser** | [docs/kvs-parser-spec.md](docs/kvs-parser-spec.md) |
 
@@ -53,7 +53,7 @@ python3 tools/stadia_diag.py --selftest
 | `tools/stadia_diag.py` | Read-only USB HID / EP0 diagnostic tool querying safe vendor IN descriptors (`0x81`, `0x84`, `0x87`–`0x8a`, `0x8c`) |
 | `tools/udev/99-stadia-controller.rules` | Linux udev rules for App (`18d1:9400`), Bootloader (`18d1:946b`), SDP (`1fc9:0135`), and Flashloader (`15a2:0073`) |
 | `ghidra/` | Headless Ghidra scripts (`DecompAll.java`, `DecompForce.java`, `Xrefs.java`, `MapScatterLoad.java`) |
-| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI/BLE logs, and live USB CDC-ACM captures (`cdc_i2c_scan.log`, `cdc_l2r2_gpio2_10.log`, `cdc_bt_sdp_hid.log`) |
+| `evidence/` | Reference SHA-256 hashes (`SHA256SUMS.txt`), FlexSPI/BLE logs, and live USB CDC-ACM captures (`cdc_i2c_scan.log`, `cdc_l2r2_gpio2_10.log`, `cdc_bt_sdp_hid.log`, `cdc_switch2_bt_hid.log`) |
 
 ---
 

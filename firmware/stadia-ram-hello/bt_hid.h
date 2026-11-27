@@ -1,8 +1,9 @@
 #pragma once
 #include <stdint.h>
 
-/* Callback provided by main.c to transmit an HCI packet over LPUART3 */
+/* Callbacks provided by main.c */
 void bt_uart_write(const uint8_t *data, uint32_t len);
+void bt_log_acl_tx(uint16_t cid, const uint8_t *payload, uint16_t plen);
 
 /* Live controller input state populated by main.c */
 typedef struct {
@@ -105,6 +106,7 @@ static void hci_send_acl(uint16_t cid, const uint8_t *payload, uint16_t plen) {
     if (plen > 0u) {
         bt_uart_write(payload, plen);
     }
+    bt_log_acl_tx(cid, payload, plen);
 }
 
 static void l2cap_send_sig(uint8_t code, uint8_t id, const uint8_t *data, uint16_t dlen) {
@@ -631,38 +633,30 @@ static void hid_handle_output(const uint8_t *data, uint16_t len, const pro_input
             0x40u, 0x05u, 0x54u, 0x00u, 0x08u, 0x80u, 0x40u, 0x05u, 0x54u,
             0x00u, 0x08u, 0x80u, 0x40u, 0x05u, 0x54u, 0x40u, 0x05u, 0x54u
         };
-        if (addr >= 0x603Du && addr < 0x604Fu) {
-            for (uint8_t i = 0u; i < rlen; ++i) {
-                uint32_t a = addr + i;
-                if (a >= 0x603Du && a < 0x604Fu) {
-                    d[5u + i] = k_cal[a - 0x603Du];
-                }
-            }
-        } else if (addr >= 0x6050u && addr < 0x605Cu) {
-            /* Body / button / grip colors: Pro Controller dark gray */
-            static const uint8_t k_col[12] = {
-                0x32u, 0x32u, 0x32u, 0xFFu, 0xFFu, 0xFFu,
-                0x32u, 0x32u, 0x32u, 0x32u, 0x32u, 0x32u
-            };
-            for (uint8_t i = 0u; i < rlen; ++i) {
-                uint32_t a = addr + i;
-                if (a >= 0x6050u && a < 0x605Cu) {
-                    d[5u + i] = k_col[a - 0x6050u];
-                }
-            }
-        } else if (addr >= 0x6086u && addr < 0x60AAu) {
-            /* Factory stick parameters (0x6086 Left, 0x6098 Right): deadzone=0x0AE (174) */
-            static const uint8_t k_stick_params[18] = {
-                0x0Fu, 0x30u, 0x61u, 0xAEu, 0x90u, 0xD9u, 0xD4u, 0x14u, 0x54u,
-                0x41u, 0x15u, 0x54u, 0xC7u, 0x79u, 0x9Cu, 0x33u, 0x36u, 0x63u
-            };
-            for (uint8_t i = 0u; i < rlen; ++i) {
-                uint32_t a = addr + i;
-                if (a >= 0x6086u && a < 0x6098u) {
-                    d[5u + i] = k_stick_params[a - 0x6086u];
-                } else if (a >= 0x6098u && a < 0x60AAu) {
-                    d[5u + i] = k_stick_params[a - 0x6098u];
-                }
+        /* Body / button / grip colors (0x6050..0x605B): Pro Controller dark gray */
+        static const uint8_t k_col[12] = {
+            0x32u, 0x32u, 0x32u, 0xFFu, 0xFFu, 0xFFu,
+            0x32u, 0x32u, 0x32u, 0x32u, 0x32u, 0x32u
+        };
+        /* 6-axis horizontal offset (0x6080..0x6085) */
+        static const uint8_t k_imu_off[6] = { 0x50u, 0xFDu, 0x00u, 0x00u, 0xC6u, 0x0Fu };
+        /* Factory stick parameters (0x6086 Left, 0x6098 Right): deadzone=0x0AE (174) */
+        static const uint8_t k_stick_params[18] = {
+            0x0Fu, 0x30u, 0x61u, 0xAEu, 0x90u, 0xD9u, 0xD4u, 0x14u, 0x54u,
+            0x41u, 0x15u, 0x54u, 0xC7u, 0x79u, 0x9Cu, 0x33u, 0x36u, 0x63u
+        };
+        for (uint8_t i = 0u; i < rlen; ++i) {
+            uint32_t a = addr + i;
+            if (a >= 0x603Du && a < 0x604Fu) {
+                d[5u + i] = k_cal[a - 0x603Du];
+            } else if (a >= 0x6050u && a < 0x605Cu) {
+                d[5u + i] = k_col[a - 0x6050u];
+            } else if (a >= 0x6080u && a < 0x6086u) {
+                d[5u + i] = k_imu_off[a - 0x6080u];
+            } else if (a >= 0x6086u && a < 0x6098u) {
+                d[5u + i] = k_stick_params[a - 0x6086u];
+            } else if (a >= 0x6098u && a < 0x60AAu) {
+                d[5u + i] = k_stick_params[a - 0x6098u];
             }
         }
         hid_send_subcmd_reply(subcmd, 0x90u, d, (uint8_t)(5u + rlen), in);
@@ -734,12 +728,19 @@ static void l2cap_handle_sig(const uint8_t *sig, uint16_t slen) {
                 }
             }
         }
-        uint8_t rsp[6];
+        uint8_t rsp[26];
+        uint16_t opt_len = (len > 4u) ? (uint16_t)(len - 4u) : 0u;
+        if (opt_len > 20u) {
+            opt_len = 20u;
+        }
         rsp[0] = (uint8_t)(scid & 0xFFu);
         rsp[1] = (uint8_t)(scid >> 8);
         rsp[2] = 0x00u; rsp[3] = 0x00u;
         rsp[4] = 0x00u; rsp[5] = 0x00u; /* Success */
-        l2cap_send_sig(0x05u, id, rsp, 6u);
+        for (uint16_t i = 0u; i < opt_len; ++i) {
+            rsp[6u + i] = p[4u + i];
+        }
+        l2cap_send_sig(0x05u, id, rsp, (uint16_t)(6u + opt_len));
     } else if (code == 0x05u && len >= 6u) {
         /* L2CAP_Configuration_Response */
         uint16_t scid = (uint16_t)p[0] | ((uint16_t)p[1] << 8);

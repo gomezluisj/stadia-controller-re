@@ -45,7 +45,14 @@ This document summarizes the hardware-verified bring-up sequence for running cus
 2. **`LPUART3` (`0x4018C000`, `115200` baud):** Enable `RXRTSE` (`MODIR` bit 3) and TX/RX FIFOs (`FIFO` `+0x28`).
 3. **Patchram upload:** Send `HCI_Reset (0x0C03)`, `Download_Minidriver (0xFC2E)`, then the 228 `.hcd` packets extracted from `slot_a_bruce.bin` (`0x6012f5d0..0x6013c69a`, `53,450 B`).
 4. **SDP pagination (critical for macOS):** macOS sends `SDP_ServiceAttributeRequest` with `MaxAttributeByteCount = 0x0100` (256 B). HID records exceeding 256 B **must** be paginated using a 2-byte `ContinuationState`, otherwise macOS silently drops L2CAP SDP and disconnects ACL 15 s later (`0x13`).
-5. **Switch Pro Controller (`057E:2009`) SPI calibration & stick parameters (critical for macOS `GCController`):**
-   - Factory stick calibration (`0x603D..0x604E`): pack both X and Y ranges as `0x600` (`{ 0x00, 0x06, 0x60 }`) around `0x800` center (`{ 0x00, 0x08, 0x80 }`).
-   - Factory stick parameters (`0x6086..0x6097` Left, `0x6098..0x60A9` Right): do **not** return `0xFF × 18` — bytes `3..5` encode the deadzone (`0xFFF = 4095`), which causes macOS `AppleGCHIDUserEventDriver` / `GCController` to clamp all 4 stick axes to `0.00`. Return the standard Pro Controller parameter block (`deadzone = 0x0AE = 174`).
-6. **Verified end-to-end on macOS (`GameController.framework`):** enumerates natively as `Switch Pro Controller` (`extendedGamepad = true`) with buttons (`A/B/X/Y`, `L1/R1`, `L2/ZL`, `R2/ZR`, `L3/R3`, `Plus/Minus`, `D-Pad`) and all 4 analog axes (`LX/LY`, `RX/RY`) live over Classic Bluetooth.
+5. **Switch Pro Controller (`057E:2009`) SPI calibration & stick parameters (critical for macOS `GCController` & Switch 2):**
+   - Factory stick calibration (`0x603D..0x604E`): pack both X and Y ranges as `0x540` (`1344`, `{ 0x40, 0x05, 0x54 }`) around `0x800` center (`{ 0x00, 0x08, 0x80 }`) so Stadia sticks reach full `±1.00`.
+   - Factory stick parameters (`0x6086..0x6097` Left, `0x6098..0x60A9` Right): do **not** return `0xFF × 18` — bytes `3..5` encode the deadzone (`0xFFF = 4095`), which causes hosts to clamp all 4 stick axes to `0.00`. Return the standard Pro Controller parameter block (`deadzone = 0x0AE = 174`), and handle combined/overlapping SPI reads byte-by-byte (Switch 2 reads `0x6080` len `0x18` spanning `0x6080..0x6097`, and `0x603D` len `0x19` spanning `0x603D..0x6055`).
+6. **Nintendo Switch 2 pairing requirements (critical — skipping these causes instant `0x13` disconnect right after L2CAP open):**
+   - Reply **`Auth_Requirements = 0x04` (General Bonding)** in `HCI_IO_Capability_Request_Reply` (not `0x02` Dedicated Bonding).
+   - Enable Role Switch + Sniff Mode via `HCI_Write_Default_Link_Policy_Settings (0x080F)` = `0x0005` (Switch 2 immediately enters Sniff Mode `HCI EVT 0x14` after L2CAP `0x0011`/`0x0013` open).
+   - Echo the incoming MTU option (`01 02 A0 02`) in `L2CAP_Configuration_Response (0x05)`.
+   - Keep `0x3F` mode event-driven (no unsolicited `0x3F` flood right after `0x0013` opens); pressing `L + R` triggers Switch 2's full Pro Controller init sequence (`0x02`, `0x08`, `0x10`, `0x03 0x30`, `0x40`, `0x30`, `0x48`).
+7. **Verified end-to-end on macOS & Nintendo Switch 2:**
+   - **macOS (`GameController.framework`):** enumerates natively as `Switch Pro Controller` (`extendedGamepad = true`); all buttons (`A/B/X/Y`, `L1/R1`, `L2/ZL` & `R2/ZR` with zero-chatter hysteresis, `L3/R3`, `Plus/Minus`, 4-way `D-Pad`) and all 4 analog axes (`LX/LY`, `RX/RY` reaching `[-1.00..+1.00]`) verified live.
+   - **Nintendo Switch 2:** pairs via *Controllers → Change Grip/Order* (`L + R`), completes full Pro Controller init, and all buttons, triggers (`L2`/`R2`), and sticks work live.

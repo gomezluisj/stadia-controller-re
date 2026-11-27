@@ -925,6 +925,10 @@ static int bt_boot_and_advertise(int has_led, uint32_t i2c_base, uint8_t lp_addr
     static const uint8_t ssp_en = 0x01u;
     (void)hci_send_cmd(0x0C56u, &ssp_en, 1u, evt, sizeof(evt));
 
+    /* Enable Role Switch (bit 0) + Sniff Mode (bit 2) in default link policy */
+    static const uint8_t link_pol[2] = { 0x05u, 0x00u };
+    (void)hci_send_cmd(0x080Fu, link_pol, 2u, evt, sizeof(evt));
+
     static const uint8_t scan_both = 0x03u; /* Inquiry + Page Scan */
     if (hci_send_cmd(0x0C1Au, &scan_both, 1u, evt, sizeof(evt)) != 0) {
         return 0;
@@ -966,6 +970,29 @@ static void log_hci_pkt(const char *tag, const uint8_t *buf, uint32_t len) {
         usb_cdc_put_hex8(buf[i]);
     }
     if (len > n) {
+        usb_cdc_puts(" ...");
+    }
+    usb_cdc_puts("\r\n");
+}
+
+void bt_log_acl_tx(uint16_t cid, const uint8_t *payload, uint16_t plen) {
+    if (!g_usb_cfg || !g_usb_dtr) {
+        return;
+    }
+    /* Log all signaling/SDP/HID-control/0x21 replies; skip high-rate 0x30 streaming */
+    if (cid == g_bt.l2cap_host_cid[2] && plen >= 2u && payload[1] == 0x30u) {
+        return;
+    }
+    usb_cdc_puts("ACL TX[");
+    usb_cdc_put_hex8((uint8_t)(cid >> 8));
+    usb_cdc_put_hex8((uint8_t)(cid & 0xFFu));
+    usb_cdc_puts("]:");
+    uint32_t n = (plen > 24u) ? 24u : plen;
+    for (uint32_t i = 0u; i < n; ++i) {
+        usb_cdc_puts(" ");
+        usb_cdc_put_hex8(payload[i]);
+    }
+    if (plen > n) {
         usb_cdc_puts(" ...");
     }
     usb_cdc_puts("\r\n");
@@ -1015,14 +1042,14 @@ static void bt_handle_hci_event(const uint8_t *buf, uint32_t len) {
         /* HCI_Number_Of_Completed_Packets */
         bt_handle_num_completed_packets(buf, len);
     } else if (evt == 0x31u && len >= 8u) {
-        /* HCI_IO_Capability_Request -> NoInputNoOutput (0x03), OOB=0, Auth=0x02 (General Bonding) */
+        /* HCI_IO_Capability_Request -> NoInputNoOutput (0x03), OOB=0, Auth=0x04 (General Bonding) */
         uint8_t p[9];
         for (uint32_t i = 0u; i < 6u; ++i) {
             p[i] = buf[2u + i];
         }
         p[6] = 0x03u;
         p[7] = 0x00u;
-        p[8] = 0x02u;
+        p[8] = 0x04u;
         hci_send_cmd_nb(0x042Bu, p, 9u);
     } else if (evt == 0x33u && len >= 8u) {
         /* HCI_User_Confirmation_Request -> Positive Reply (Just Works) */
@@ -1248,9 +1275,21 @@ void Reset_Handler(void) {
         in.lx = (uint16_t)(lx_s < 0 ? 0 : (lx_s > 4095 ? 4095 : lx_s));
         in.ly = (uint16_t)(ly_s < 0 ? 0 : (ly_s > 4095 ? 4095 : ly_s));
 
-        if (has_bt && g_bt.hid_ready && ((DIAG_STATUS->ticks & 127u) == 0u)) {
-            hid_send_input_report(&in);
+        static uint32_t prev_btn_packed = 0u;
+        uint32_t btn_packed = (uint32_t)in.btn_right |
+                              ((uint32_t)in.btn_shared << 8) |
+                              ((uint32_t)in.btn_left << 16);
+        if (has_bt && g_bt.hid_ready) {
+            if (g_bt.report_mode == 0x30u) {
+                if ((DIAG_STATUS->ticks & 255u) == 0u) {
+                    hid_send_input_report(&in);
+                }
+            } else if (btn_packed != prev_btn_packed) {
+                /* 0x3F simple mode: only emit on button change (no unsolicited flood on pairing) */
+                hid_send_input_report(&in);
+            }
         }
+        prev_btn_packed = btn_packed;
 
         if (has_led) {
             uint8_t on = ((DIAG_STATUS->ticks >> 12) & 1u) ? 1u : 0u;
